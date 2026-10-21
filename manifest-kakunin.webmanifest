@@ -1,0 +1,22 @@
+{
+  "id": "mhs-kakunin",
+  "name": "日報を見る｜MHS",
+  "short_name": "日報確認",
+  "start_url": "kakunin.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1c4b34",
+  "icons": [
+    {
+      "src": "kakunin-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "kakunin-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

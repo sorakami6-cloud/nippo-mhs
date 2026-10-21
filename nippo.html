@@ -1,0 +1,2144 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>おまかせ班長</title>
+<link rel="icon" type="image/png" sizes="32x32" href="nippo-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="nippo-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="nippo-180.png">
+<link rel="manifest" href="manifest-nippo.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="日報">
+<meta name="theme-color" content="#1c4b34">
+<script>
+/* ============================================================
+   おまかせ班長  会社ごとの設定（MHS）
+   会社ごとに違うのはここだけ。3つの画面に同じものが入っています。
+   ============================================================ */
+window.NIPPO = {
+  company: "MHS",
+  /* つなぐ先（MHSのFirebase：nippo-mhs） */
+  firebase: {
+    apiKey: "AIzaSyB6mKuTSdXj5pYrp-F9XGuBKS69jY43bUA",
+    authDomain: "nippo-mhs.firebaseapp.com",
+    databaseURL: "https://nippo-mhs-default-rtdb.firebaseio.com",
+    projectId: "nippo-mhs",
+    storageBucket: "nippo-mhs.firebasestorage.app",
+    messagingSenderId: "540811383321",
+    appId: "1:540811383321:web:d03588d2d1f1ab92add088"
+  },
+  kubun: ["現場", "工場"],          /* 日報の区分ボタン */
+  yakuin: [],                       /* 職長手当から外す役員 */
+  adminPin: "2481",                 /* 管理画面「日報管理」の暗証番号 */
+  demenMark: {},                    /* 出面表の記号。例 {"工場":"〇"} */
+  storagePrefix: "mhs",             /* 端末に覚えさせるときの名札（会社ごとに別） */
+  /* お試しモードで最初から入っている名簿 */
+  members: {
+    "自社": { "MHS": [] },
+    "常駐協力": {},
+    "外注協力": {}
+  }
+};
+</script>
+<script>
+/* ============================================================
+   データベースの入り口
+   ・つなぐ先が入っていれば Firebase（本番・全員で共有）
+   ・空なら「お試しモード」：この端末の中だけに保存する簡易版
+   ============================================================ */
+(function(){
+  function clone(v){ return (v === undefined || v === null) ? null : JSON.parse(JSON.stringify(v)); }
+  function parts(p){ return String(p || "").split("/").filter(Boolean); }
+  /* Firebase と同じく、0,1,2… の番号だけが並ぶ入れ物は配列として返す */
+  function norm(v){
+    if(v === null || typeof v !== "object") return v;
+    if(Array.isArray(v)){
+      const a = v.map(norm);
+      return a.some(x => x !== null && x !== undefined) ? a.map(x => x === undefined ? null : x) : null;
+    }
+    const ks = Object.keys(v).filter(k => v[k] !== null && v[k] !== undefined);
+    if(!ks.length) return null;
+    const o = {}; ks.forEach(k => { const x = norm(v[k]); if(x !== null) o[k] = x; });
+    const ok = Object.keys(o);
+    if(!ok.length) return null;
+    if(ok.every(k => /^(0|[1-9]\d*)$/.test(k))){
+      const mx = Math.max.apply(null, ok.map(Number));
+      if(mx < ok.length * 2){ const a = []; for(let i = 0; i <= mx; i++) a.push(o[i] === undefined ? null : o[i]); return a; }
+    }
+    return o;
+  }
+
+  function localDB(key, seed, writeError){
+    let tree = {};
+    function load(){
+      try{ tree = JSON.parse(localStorage.getItem(key) || "null") || {}; }catch(e){ tree = {}; }
+      if(typeof tree !== "object") tree = {};
+    }
+    function save(){ try{ localStorage.setItem(key, JSON.stringify(tree)); }catch(e){} }
+    load();
+    if(!tree.master && seed){ tree = clone(seed); save(); }
+
+    let listeners = [];
+    function get(p){
+      let o = tree;
+      for(const k of parts(p)){ if(o === null || typeof o !== "object") return null; o = o[k]; }
+      return o === undefined ? null : o;
+    }
+    function setAt(p, v){
+      const ks = parts(p);
+      if(!ks.length){ tree = (v && typeof v === "object") ? clone(v) : {}; return; }
+      let o = tree;
+      for(let i = 0; i < ks.length - 1; i++){
+        if(o[ks[i]] === null || o[ks[i]] === undefined || typeof o[ks[i]] !== "object") o[ks[i]] = {};
+        o = o[ks[i]];
+      }
+      const last = ks[ks.length - 1];
+      if(v === null || v === undefined){ if(Array.isArray(o)) o[last] = null; else delete o[last]; }
+      else o[last] = clone(v);
+    }
+    function snap(p, raw){
+      const val = norm(clone(raw));
+      const s = {
+        key: parts(p).pop() || null,
+        val: () => clone(val),
+        exists: () => val !== null,
+        numChildren: () => (val && typeof val === "object") ? Object.keys(val).filter(k => val[k] !== null).length : 0,
+        hasChild: c => !!(val && typeof val === "object" && val[c] !== null && val[c] !== undefined),
+        child: c => snap(p + "/" + c, val && typeof val === "object" ? val[c] : null),
+        forEach(cb){
+          if(!val || typeof val !== "object") return false;
+          for(const k of Object.keys(val)){
+            if(val[k] === null || val[k] === undefined) continue;
+            if(cb(snap(p + "/" + k, val[k])) === true) return true;
+          }
+          return false;
+        }
+      };
+      return s;
+    }
+    function fire(){ listeners.forEach(l => setTimeout(() => { try{ l.cb(snap(l.p, l.read())); }catch(e){ console.error(e); } }, 0)); }
+    function commit(){ save(); fire(); return Promise.resolve(); }
+    function denied(){ return Promise.reject(new Error(writeError)); }
+    window.addEventListener("storage", e => { if(e.key === key){ load(); fire(); } });
+
+    function query(p, q){
+      function read(){
+        let v = get(p);
+        if(v && typeof v === "object" && q.child !== undefined){
+          const out = {};
+          Object.keys(v).forEach(k => {
+            const c = v[k]; if(!c || typeof c !== "object") return;
+            const x = c[q.child];
+            if(q.eq !== undefined && x !== q.eq) return;
+            if(q.start !== undefined && !(x >= q.start)) return;
+            if(q.end !== undefined && !(x <= q.end)) return;
+            out[k] = c;
+          });
+          v = Object.keys(out).length ? out : null;
+        }
+        if(v && typeof v === "object" && q.last){
+          const ks = Object.keys(v).slice(-q.last), o = {}; ks.forEach(k => o[k] = v[k]); v = o;
+        }
+        return v;
+      }
+      const o = {
+        orderByChild(c){ q.child = c; return o; }, orderByKey(){ return o; },
+        equalTo(v){ q.eq = v; return o; }, startAt(v){ q.start = v; return o; }, endAt(v){ q.end = v; return o; },
+        limitToLast(n){ q.last = n; return o; }, limitToFirst(){ return o; },
+        once(ev, cb){ const s = snap(p, read()); if(cb) setTimeout(() => cb(s), 0); return Promise.resolve(s); },
+        on(ev, cb){ listeners.push({ p, cb, read }); setTimeout(() => cb(snap(p, read())), 0); return cb; },
+        off(ev, cb){ listeners = listeners.filter(l => !(l.p === p && (!cb || l.cb === cb))); }
+      };
+      return o;
+    }
+    function ref(p){
+      p = parts(p).join("/");
+      /* 絞り込み（orderByChild など）は毎回あたらしい問い合わせを作る */
+      const r = {
+        orderByChild: c => query(p, {}).orderByChild(c),
+        orderByKey: () => query(p, {}),
+        limitToLast: n => query(p, {}).limitToLast(n),
+        limitToFirst: () => query(p, {}),
+        off: (ev, cb) => { listeners = listeners.filter(l => !(l.p === p && (!cb || l.cb === cb))); }
+      };
+      r.key = parts(p).pop() || null;
+      r.child = c => ref(p + "/" + c);
+      r.on = (ev, cb) => { listeners.push({ p, cb, read: () => get(p) }); setTimeout(() => cb(snap(p, get(p))), 0); return cb; };
+      r.once = (ev, cb) => { const s = snap(p, get(p)); if(cb) setTimeout(() => cb(s), 0); return Promise.resolve(s); };
+      r.set = v => { if(writeError) return denied(); setAt(p, v); return commit(); };
+      r.update = o => { if(writeError) return denied(); Object.keys(o || {}).forEach(k => setAt(p ? p + "/" + k : k, o[k])); return commit(); };
+      r.remove = () => { if(writeError) return denied(); setAt(p, null); return commit(); };
+      r.push = v => {
+        const k = "-L" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const c = ref(p + "/" + k);
+        const pr = (v === undefined) ? Promise.resolve() : c.set(v);
+        c.then = (a, b) => pr.then(a, b); c.catch = f => pr.catch(f);
+        return c;
+      };
+      return r;
+    }
+    return { ref };
+  }
+
+  function seedFrom(N){
+    const workers = {}; let i = 0;
+    Object.keys(N.members || {}).forEach(kubun => {
+      const cos = N.members[kubun] || {};
+      Object.keys(cos).forEach(co => (cos[co] || []).forEach(name => {
+        i++; workers["w" + String(i).padStart(3, "0")] = { name, kubun, shozoku: co, active: true };
+      }));
+    });
+    return { master: { workers, updatedAt: "お試しモード" } };
+  }
+  function banner(text, bg){
+    function put(){
+      if(document.getElementById("nippoModeBar")) return;
+      const d = document.createElement("div");
+      d.id = "nippoModeBar";
+      d.style.cssText = "background:" + bg + ";color:#fff;padding:8px 14px;font-size:13px;line-height:1.5;text-align:center";
+      d.textContent = text;
+      document.body.insertBefore(d, document.body.firstChild);
+    }
+    if(document.body) put(); else document.addEventListener("DOMContentLoaded", put);
+  }
+
+  window.NIPPO_MODE = "";
+  window.NIPPO_OPEN_DB = function(){
+    const N = window.NIPPO, c = N.firebase || {};
+    const configured = /^https:\/\//.test(c.databaseURL || "") && c.apiKey && c.projectId;
+    if(configured && window.firebase && firebase.initializeApp){
+      window.NIPPO_MODE = "firebase";
+      if(!firebase.apps || !firebase.apps.length) firebase.initializeApp(c);
+      const fdb = firebase.database();
+      /* 名簿がまだ1人も入っていないときだけ、上の members を最初の名簿として入れる
+         （すでに入っていれば何もしない。管理画面で直した名簿を上書きすることはない） */
+      const first = seedFrom(N).master.workers;
+      if(Object.keys(first).length){
+        fdb.ref("master/workers").transaction(cur => (cur === null ? first : undefined)).catch(() => {});
+      }
+      return fdb;
+    }
+    if(configured){
+      /* 本番の設定はあるのに、Firebase の部品が読めなかった＝ネットにつながっていない */
+      window.NIPPO_MODE = "offline";
+      banner("インターネットにつながっていません。電波のよい所で開き直してください（今は送信できません）", "#8e0b4c");
+      return localDB(N.storagePrefix + ".offline", null, "インターネットにつながっていないため、送れませんでした");
+    }
+    window.NIPPO_MODE = "demo";
+    banner("お試しモード：データはこの端末の中だけに保存されます（本番はFirebaseにつないでから）", "#9a6316");
+    return localDB(N.storagePrefix + ".demo", seedFrom(N), "");
+  };
+})();
+</script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+<style>
+  :root{
+    --green:#1c4b34; --green-d:#123424; --tint:#e6ede8;
+    --ink:#201e1d; --muted:#605d5d; --faint:#7d7979; --dim:#9b9797; --pale:#c8c5c5;
+    --line:rgba(32,30,29,.2); --line-s:rgba(32,30,29,.26); --line-w:rgba(32,30,29,.14);
+    --paper:#f3f2f2; --card:#faf9f7; --field:#eae9e9;
+    --mag:#d6006c; --mag-d:#8e0b4c; --mag-bg:#fbe6f0; --mag-l:#a8306f;
+    --amber:#a86a12; --amber-bg:#faf0dc;
+    --steel:#33526e; --steel-bg:#e8eff5;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  body{font-family:"Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;
+    background:var(--paper);color:var(--ink);line-height:1.6;}
+  button{font-family:inherit;}
+  .wrap{max-width:520px;margin:0 auto;padding:22px 20px 40px;}
+
+  /* ---- 見出し ---- */
+  .brand{font-size:12px;letter-spacing:.14em;color:var(--muted);}
+  h1.big{margin:10px 0 4px;font-size:38px;font-weight:700;letter-spacing:-.01em;line-height:1.05;}
+  .sub{font-size:15px;color:var(--muted);}
+
+  /* ---- トップの大ボタン ---- */
+  .menu{display:flex;flex-direction:column;gap:14px;margin-top:36px;}
+  .mbtn{display:block;width:100%;text-align:left;padding:24px 22px;border-radius:2px;cursor:pointer;
+    font-size:25px;font-weight:600;line-height:1.2;}
+  .mbtn .s{font-size:14px;font-weight:400;margin-top:6px;line-height:1.4;}
+  .mbtn.p{background:var(--green);color:#f3f2f2;border:none;}
+  .mbtn.p .s{color:rgba(243,242,242,.75);}
+  .mbtn.o{background:transparent;color:var(--ink);border:1.5px solid var(--ink);}
+  .mbtn.o .s{color:var(--muted);}
+  .mbtn.g{background:transparent;color:var(--ink);border:1px solid var(--line-s);}
+  .mbtn.g .s{color:var(--muted);}
+  .lastsend{margin-top:30px;font-size:13px;color:var(--faint);line-height:1.7;}
+  .lastsend .no{font:600 14px/1.3 ui-monospace,monospace;letter-spacing:.05em;color:var(--green);}
+
+  /* ---- 画面ヘッダ ---- */
+  .bar-top{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line-w);
+    background:var(--paper);position:sticky;top:0;z-index:5;}
+  .bar-top .bk{background:transparent;border:none;font-size:16px;color:var(--muted);cursor:pointer;padding:4px 0;}
+  .bar-top .tt{font-size:17px;font-weight:600;}
+  .bar-top .rt{margin-left:auto;font-size:13px;color:var(--faint);}
+
+  /* ---- 部品 ---- */
+  .step{font-size:13px;color:var(--muted);letter-spacing:.02em;margin-bottom:8px;}
+  .step em{font-style:normal;color:var(--faint);}
+  .sec{margin-bottom:26px;}
+  .note{font-size:13px;color:var(--faint);margin-top:9px;line-height:1.6;}
+  .card{width:100%;text-align:left;padding:17px 18px;background:transparent;
+    border:1px dashed rgba(32,30,29,.34);border-radius:2px;cursor:pointer;}
+  .card.on{background:var(--tint);border:1.5px solid var(--green);}
+  .card .big{font-size:23px;font-weight:600;}
+  .card .big.off{color:var(--faint);font-weight:400;}
+  .card .no{font:600 19px/1.2 ui-monospace,monospace;letter-spacing:.06em;color:var(--green);}
+  .card .no.none{color:var(--faint);}
+  .card .nm{margin-top:4px;font-size:18px;}
+  .card .hint{margin-top:4px;font-size:13px;color:var(--faint);}
+  .card .rt{float:right;font-size:14px;color:var(--muted);text-decoration:underline;}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;}
+  .chip{padding:13px 18px;min-height:56px;background:transparent;color:var(--ink);
+    border:1px solid var(--line-s);border-radius:2px;font-size:17px;white-space:nowrap;cursor:pointer;}
+  .chip.on{background:var(--green);color:#f3f2f2;border-color:var(--green);font-weight:600;}
+  .chip.sm{min-height:44px;padding:10px 14px;font-size:15px;}
+  /* 引く時間（遅刻・早退）は色を変えて、足す時間と間違えないようにする */
+  .chip.mn{border-color:rgba(214,0,108,.45);color:var(--mag-d);}
+  .chip.mn.on{background:var(--mag);border-color:var(--mag);color:#f3f2f2;}
+  .kgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+  .kgrid .chip{justify-content:center;text-align:center;padding:16px 4px;font-size:17px;}
+
+  .ngrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+  /* ---- メンバーの3グループ ---- */
+  .mgtabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px;}
+  .mgtab{min-height:58px;padding:9px 6px;background:transparent;color:var(--ink);
+    border:1px solid var(--line-s);border-radius:2px;cursor:pointer;line-height:1.25;}
+  .mgtab .g{font-size:15px;font-weight:600;}
+  .mgtab .c{display:block;margin-top:3px;font-size:12.5px;color:var(--faint);}
+  .mgtab .c.has{color:var(--green);font-weight:600;}
+  .mgtab.open{background:var(--tint);border:1.5px solid var(--green);}
+  .mgtab.open .g{color:var(--green);}
+  .mgsec{margin-bottom:12px;}
+  .mgsec .lbl2{font-size:12.5px;color:var(--muted);margin:2px 0 6px;}
+  .mgpick{font-size:13.5px;color:var(--green);padding:8px 0 2px;line-height:1.6;}
+  .nchip{height:62px;padding:0 6px;background:transparent;color:var(--ink);border:1px solid var(--line-s);
+    border-radius:2px;font-size:19px;white-space:nowrap;overflow:hidden;cursor:pointer;}
+  .nchip.on{background:var(--green);color:#f3f2f2;border-color:var(--green);font-weight:600;}
+  .nchip.rest{border:1px dashed rgba(32,30,29,.2);color:var(--dim);font-size:17px;}
+
+  .row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;
+    min-height:64px;padding:14px 18px;background:transparent;border:1px solid var(--line);
+    border-radius:2px;cursor:pointer;text-align:left;margin-bottom:8px;font-size:17px;}
+  .row.on{background:var(--tint);border-color:var(--green);}
+  .row .v{font-size:23px;font-weight:600;}
+  .row .v.z{color:var(--dim);font-weight:400;}
+
+  .prow{width:100%;padding:16px 18px;background:transparent;border:1px solid var(--line);
+    border-radius:2px;cursor:pointer;text-align:left;margin-bottom:8px;}
+  .prow.ed{background:var(--tint);border-color:var(--green);border-left:4px solid var(--green);}
+  .prow .t1{display:flex;align-items:baseline;justify-content:space-between;gap:10px;}
+  .prow .nm{font-size:19px;font-weight:600;}
+  .prow .nm em{font-style:normal;font-size:13px;color:var(--green);margin-left:8px;}
+  .prow .tt{font-size:22px;font-weight:600;}
+  .prow .dt{margin-top:5px;font-size:13.5px;color:var(--faint);}
+  .prow .tap{margin-top:5px;font-size:12.5px;color:var(--faint);}
+  /* 内訳は小さい灰色をやめて、合計と同じくらいの大きさで横並びに */
+  .brk{margin-top:6px;font-size:15.5px;line-height:1.8;color:var(--ink);}
+  .brk .mn{color:var(--mag-d);font-weight:600;}
+  .brk .sep{color:var(--faint);margin:0 5px;}
+  .brk .z{color:var(--faint);}
+
+  .btn{width:100%;min-height:60px;padding:16px;background:var(--green);color:#f3f2f2;
+    border:none;border-radius:2px;font-size:19px;font-weight:600;cursor:pointer;}
+  .btn:disabled{background:rgba(32,30,29,.18);cursor:default;}
+  .btn.o{background:transparent;color:var(--ink);border:1px solid var(--line-s);font-weight:400;}
+  .btn.d{background:transparent;color:var(--muted);border:1px dashed rgba(32,30,29,.34);
+    font-weight:400;font-size:17px;min-height:56px;text-align:left;}
+  .btn.sm{min-height:52px;font-size:17px;}
+
+  input[type=text],input[type=password],input[type=search]{width:100%;min-height:56px;padding:14px 16px;
+    background:var(--field);border:1px solid var(--line);border-radius:2px;font-size:18px;
+    color:var(--ink);outline:none;font-family:inherit;}
+  input:focus{border:1.5px solid var(--green);}
+
+  /* ---- シート ---- */
+  .bd{position:fixed;inset:0;background:rgba(32,30,29,.34);opacity:0;pointer-events:none;
+    transition:opacity .26s ease;z-index:40;}
+  .bd.on{opacity:1;pointer-events:auto;}
+  .sheet{position:fixed;left:0;right:0;bottom:0;max-width:520px;margin:0 auto;max-height:88vh;
+    overflow-y:auto;background:var(--paper);border-top:1px solid var(--line);
+    box-shadow:0 -12px 32px rgba(45,43,43,.18);padding:20px 22px 26px;
+    transform:translateY(110%);transition:transform .26s cubic-bezier(.22,.61,.36,1);z-index:41;}
+  .sheet.on{transform:translateY(0);}
+  .sheet h2{font-size:19px;margin-bottom:14px;}
+  .sheet .lbl{font-size:13px;color:var(--muted);font-weight:600;margin:16px 0 8px;}
+
+  /* ---- カレンダー ---- */
+  .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;}
+  .cal .wd{text-align:center;font-size:13px;padding-bottom:6px;color:var(--faint);}
+  .cal .wd.sun{color:var(--mag);} .cal .wd.sat{color:var(--green);}
+  .cal button{height:56px;background:transparent;border:1px solid var(--line-w);border-radius:2px;
+    font-size:20px;cursor:pointer;color:var(--ink);}
+  .cal button.sun{color:var(--mag);}
+  .cal button.sent{border-bottom:3px solid var(--green);}
+  .cal button.on{background:var(--green);color:#f3f2f2;border-color:var(--green);font-weight:600;}
+  .cal button.na{border:none;background:transparent;cursor:default;}
+  .cal button:disabled{color:var(--pale);cursor:default;}
+  .calhd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+  .calhd button{background:transparent;border:none;font-size:16px;color:var(--muted);cursor:pointer;padding:8px;}
+  .calhd .m{font-size:17px;font-weight:600;}
+
+  /* ---- 工事行 ---- */
+  .job{width:100%;padding:15px 17px;background:transparent;border:1px solid var(--line);
+    border-radius:2px;cursor:pointer;text-align:left;margin-bottom:8px;}
+  .job.on{background:var(--tint);border:1.5px solid var(--green);}
+  .job .no{font:600 19px/1.2 ui-monospace,monospace;letter-spacing:.06em;color:var(--green);}
+  .job .nm{margin-top:6px;font-size:18px;line-height:1.4;}
+  .job .mt{margin-top:6px;font-size:13px;color:var(--faint);}
+  .job .badge{display:inline-block;margin-top:8px;padding:4px 9px;background:var(--tint);
+    color:var(--green);border-radius:2px;font-size:13px;font-weight:600;}
+  .jrow{display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line-w);}
+  .jrow.stale{background:var(--mag-bg);border-left:3px solid var(--mag);padding:12px 14px;border-radius:2px;}
+  .jrow.soon{background:var(--amber-bg);border-left:3px solid var(--amber);padding:12px 14px;border-radius:2px;}
+  .jrow.soon .no,.jrow.soon .nm{color:var(--amber);}
+  .jrow.soon .nm{font-weight:600;}
+  .jrow .bd2{flex:1;min-width:0;}
+  .jrow.stale .no{color:var(--mag-d);}
+  .jrow.stale .nm{color:var(--mag-d);font-weight:600;}
+  .jrow.stale .mt{color:var(--mag-l);}
+  .jrow .warn{margin-top:8px;font-size:14px;font-weight:600;color:var(--mag-d);}
+  .trash{flex:none;width:52px;height:52px;display:flex;align-items:center;justify-content:center;
+    background:transparent;border:1px solid rgba(32,30,29,.22);border-radius:2px;
+    font-size:22px;color:var(--muted);cursor:pointer;}
+  .jrow.stale .trash{border-color:rgba(214,0,108,.45);color:var(--mag-d);}
+  .restore{min-height:44px;padding:10px 14px;background:transparent;border:1px solid var(--line-s);
+    border-radius:2px;font-size:15px;cursor:pointer;}
+  .warnbox{background:var(--mag-bg);border-left:3px solid var(--mag);border-radius:2px;
+    padding:12px 14px;font-size:14px;color:var(--mag-d);margin-bottom:14px;line-height:1.6;}
+  #ovList p{margin:0 0 14px;font-size:16px;line-height:1.7;}
+  #ovList b{color:var(--mag-d);}
+
+  /* ---- テンキー ---- */
+  .padv{font-size:44px;font-weight:700;text-align:center;padding:10px 0;letter-spacing:.02em;}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;}
+  .pad button{height:62px;background:var(--field);border:1px solid var(--line);border-radius:2px;
+    font-size:26px;font-weight:600;cursor:pointer;}
+  .pad button.bs{background:transparent;}
+
+  /* ---- 休み ---- */
+  .offitem{border:1px solid var(--line);border-radius:2px;padding:13px 15px;margin-bottom:8px;background:var(--card);}
+  .offitem .hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+  .offitem .nm{font-size:18px;font-weight:600;}
+  .offitem .rs{display:flex;gap:6px;}
+  .offitem .rs .chip{flex:1;justify-content:center;text-align:center;min-height:46px;padding:10px 2px;font-size:15px;}
+
+  /* ---- 確認・完了 ---- */
+  .cfm dt{font-size:12px;color:var(--faint);}
+  .cfm dd{font-size:19px;margin:2px 0 16px;}
+  .cfm dd .no{font:600 19px/1.2 ui-monospace,monospace;letter-spacing:.06em;color:var(--green);}
+  .cfmtot{display:flex;align-items:baseline;justify-content:space-between;
+    padding-top:14px;border-top:1px solid var(--line);margin-bottom:14px;}
+  .cfmtot .l{font-size:16px;} .cfmtot .v{font-size:24px;font-weight:700;}
+  .srow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:11px 0;
+    border-bottom:1px solid var(--line-w);}
+  .srow .n{font-size:18px;} .srow .n em{font-style:normal;font-size:12px;color:var(--green);margin-left:6px;}
+  .srow .t{font-size:20px;font-weight:600;}
+  .srow .d{font-size:13px;color:var(--faint);margin-top:3px;}
+  .received{font-size:12px;letter-spacing:.14em;color:var(--muted);}
+  .done-h{margin:10px 0 22px;font-size:34px;font-weight:700;}
+
+  .empty{text-align:center;color:var(--faint);font-size:14px;padding:40px 0;}
+  .screen{display:none;} .screen.on{display:block;}
+
+  /* ---- この端末の名前 ---- */
+  .mebar{display:flex;align-items:baseline;gap:10px;margin-top:26px;padding:12px 14px;
+    background:var(--card);border:1px solid var(--line-w);border-radius:2px;}
+  .mebar .l{font-size:12.5px;color:var(--faint);}
+  .mebar .n{font-size:18px;font-weight:600;}
+  .mebar .ch{margin-left:auto;background:transparent;border:none;font-size:13.5px;
+    color:var(--muted);text-decoration:underline;cursor:pointer;padding:4px 0;}
+
+  /* ---- 送信履歴 ---- */
+  .hcard{border:1px solid var(--line);border-radius:2px;padding:15px 16px;margin-bottom:12px;background:var(--card);}
+  .hcard .hd{display:flex;align-items:baseline;justify-content:space-between;gap:10px;}
+  .hcard .dt{font-size:14.5px;color:var(--muted);}
+  .hcard .tt{font-size:21px;font-weight:700;}
+  .hcard .no{font:600 16px/1.2 ui-monospace,monospace;letter-spacing:.05em;color:var(--green);}
+  .hcard .nm{margin-top:5px;font-size:17.5px;line-height:1.4;}
+  .hcard .mt{margin-top:6px;font-size:13.5px;color:var(--faint);line-height:1.7;}
+  .hcard .acts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:13px;}
+  .hcard .acts button{min-height:54px;padding:8px 4px;border-radius:2px;font-size:15px;line-height:1.3;
+    font-family:inherit;cursor:pointer;background:transparent;border:1px solid var(--line-s);color:var(--ink);}
+  .hcard .acts button.rep{border-color:var(--green);color:var(--green);font-weight:600;}
+  .hcard .acts button.del{border-color:rgba(214,0,108,.45);color:var(--mag-d);}
+  .flash{background:var(--tint);border-left:3px solid var(--green);border-radius:2px;
+    padding:12px 14px;font-size:14.5px;color:var(--green-d);margin-bottom:14px;line-height:1.6;}
+  .whybox .lb{font-size:13px;color:var(--muted);font-weight:600;margin-bottom:8px;}
+
+  /* ---- 工事一覧のしぼり込み ---- */
+  /* 1行3つ。数が半端でも、最後の行は横に伸びて隙間なく埋まる */
+  .fillrow{display:flex;flex-wrap:wrap;gap:8px;}
+  .fillrow .chip{flex:1 1 calc(33.333% - 6px);min-height:50px;padding:9px 4px;font-size:15px;
+    white-space:normal;line-height:1.3;display:flex;align-items:center;justify-content:center;
+    text-align:center;gap:4px;}
+  .fillrow .chip .n{font-size:11.5px;color:var(--faint);}
+  .fillrow .chip.on .n{color:rgba(243,242,242,.8);}
+  .flbl{font-size:12.5px;color:var(--muted);margin:16px 0 8px;}
+  .fixbar{position:sticky;bottom:0;background:var(--paper);padding:14px 0 6px;
+    border-top:1px solid var(--line-w);margin-top:24px;}
+  .fixbar .sm{display:flex;justify-content:space-between;font-size:14px;color:var(--muted);margin-bottom:10px;}
+</style>
+</head>
+<body>
+
+<!-- ===================== 名前の登録（初回） ===================== -->
+<div id="scMe" class="screen">
+<div class="wrap">
+  <div class="brand" data-co></div>
+  <h1 class="big" style="font-size:30px">お名前を選んでください</h1>
+  <div class="sub" id="meSub"></div>
+  <div style="margin-top:20px"><input type="text" id="meSearch" placeholder="名前で探す"></div>
+  <div id="meList" style="margin-top:18px"></div>
+  <button class="btn o sm" id="meCancel" style="margin-top:18px;display:none" onclick="goTop()">やめる</button>
+</div>
+</div>
+
+<!-- ===================== トップ ===================== -->
+<div id="scTop" class="screen on">
+<div class="wrap">
+  <div class="brand" data-co></div>
+  <h1 class="big">日報</h1>
+  <div class="sub" id="topDate"></div>
+  <div class="menu">
+    <button class="mbtn p" onclick="goSend()">日報を送る<div class="s">職長 ─ 今日の分を入力</div></button>
+    <button class="mbtn o" onclick="goHist()">送信履歴<div class="s" id="topHistSub">今月 自分が送った日報</div></button>
+    <button class="mbtn g" onclick="goJobs()">工事一覧<div class="s" id="topJobsSub">注番と件名を調べる</div></button>
+  </div>
+  <div class="mebar" id="topMe" style="display:none">
+    <span class="l">この端末</span><span class="n" id="topMeName"></span>
+    <button class="ch" onclick="openMe(true)">名前を変える</button>
+  </div>
+  <div class="lastsend" id="topLast"></div>
+</div>
+</div>
+
+<!-- ===================== 送信履歴 ===================== -->
+<div id="scHist" class="screen">
+  <div class="bar-top"><button class="bk" onclick="goTop()">戻る</button><span class="tt">送信履歴</span>
+    <span class="rt" id="histMonth"></span></div>
+  <div class="wrap">
+    <div id="histFlash"></div>
+    <div class="note" style="margin-top:0" id="histNote"></div>
+    <div id="histList" style="margin-top:14px"></div>
+    <div class="note">今月に送った分だけ出ています。先月より前の分は事務所で直してもらってください。</div>
+  </div>
+</div>
+
+<!-- ===================== 入力 ①〜⑥ ===================== -->
+<div id="scStep1" class="screen">
+  <div class="bar-top"><button class="bk" onclick="leaveInput()">戻る</button><span class="tt" id="ttStep1">日報を送る</span></div>
+  <div class="wrap">
+    <div class="sec">
+      <div class="step">1 ── 日付</div>
+      <button class="card on" onclick="openSheet('cal')">
+        <span class="rt">変更</span><span class="big" id="fDate"></span>
+      </button>
+    </div>
+    <div class="sec">
+      <div class="step">2 ── 職長名</div>
+      <button class="card" id="cForeman" onclick="openSheet('foreman')">
+        <span class="rt">変える</span><span class="big" id="fForeman">タップして選ぶ</span>
+      </button>
+      <div class="note">職長でない人が送るときは空欄にできます。</div>
+    </div>
+    <div class="sec">
+      <div class="step">3 ── 工事</div>
+      <button class="card" id="cJob" onclick="openSheet('job')">
+        <span class="no none" id="fJobNo">注番なし</span>
+        <div class="nm" id="fJobNm"></div>
+        <div class="hint">タップして選び直す</div>
+      </button>
+    </div>
+    <div class="sec">
+      <div class="step">4 ── 区分</div>
+      <div class="kgrid" id="fKubun"></div>
+      <div class="note">注番に「工」「設」を足す必要はありません。班を決めてある区分を選ぶと、下のメンバーがその班の人だけになります。</div>
+    </div>
+    <div class="sec">
+      <div class="step">5 ── メンバー <em id="fSelN"></em></div>
+      <div class="mgtabs" id="fMGroups"></div>
+      <div id="fMembersWrap"></div>
+      <button class="btn d" style="margin-top:10px" onclick="openSheet('member')">＋ 他の人を追加（名簿から選ぶ）</button>
+      <div class="note" id="fRosterNote"></div>
+    </div>
+    <div class="sec">
+      <div class="step">6 ── 本日休みのメンバー</div>
+      <button class="card" id="cOff" onclick="openSheet('off')"><span class="big off" id="fOff">なし</span></button>
+      <div class="note">いなければそのまま。休み・有給・欠勤・振休・特休を人ごとに選べます。</div>
+    </div>
+    <button class="btn" id="btnToTime" onclick="goStep2()">時間の入力へ　→</button>
+  </div>
+</div>
+
+<!-- ===================== 入力 ⑦⑧ ===================== -->
+<div id="scStep2" class="screen">
+  <div class="bar-top"><button class="bk" onclick="showScreen('scStep1')">戻る</button><span class="tt">7 ── 時間の入力</span></div>
+  <div class="wrap">
+    <div class="sec">
+      <div class="step">全員分の時間</div>
+      <div class="note" style="margin-top:0;margin-bottom:10px">ここに入れると下の全員に入ります</div>
+      <div id="fAllRows"></div>
+      <button class="btn d" onclick="toggleMore()" id="fMoreBtn"></button>
+      <div id="fMoreRows" style="margin-top:8px"></div>
+    </div>
+    <div class="sec">
+      <div class="step">個別 <em id="fIndN"></em> <span style="float:right;color:var(--faint)">違う人だけタップ</span></div>
+      <div class="note" style="margin-top:0;margin-bottom:10px">時間が違う人、遅刻・早退した人だけタップして直します。遅刻・早退はここから、その人だけに入れます。</div>
+      <div id="fPersonRows"></div>
+    </div>
+    <div class="sec">
+      <div class="step">8 ── チェック項目</div>
+      <div id="fChecks"></div>
+      <div class="note" id="fChecksNote"></div>
+    </div>
+    <div class="fixbar">
+      <div class="sm"><span id="fSum"></span></div>
+      <button class="btn" onclick="goConfirm()">内容を確認する　→</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 送信前の確認 ===================== -->
+<div id="scConfirm" class="screen">
+  <div class="bar-top"><button class="bk" onclick="showScreen('scStep2')">戻る</button><span class="tt" id="ttCfm">送信前の確認</span></div>
+  <div class="wrap">
+    <div class="note" style="margin-top:0" id="cfmLead">この内容で送ります</div>
+    <h1 class="big" style="font-size:30px" id="cfmDate"></h1>
+    <dl class="cfm" id="cfmBox" style="margin-top:22px"></dl>
+    <div class="cfmtot"><span class="l" id="cfmPeople"></span><span class="v" id="cfmTotal"></span></div>
+    <div id="cfmRows"></div>
+    <div id="cfmAllowWrap" style="margin-top:22px">
+      <div class="step">職長手当</div>
+      <button class="row" id="cfmAllowRow" onclick="openAllowPad()">
+        <span id="cfmAllowLbl">自動で計算した数</span>
+        <span class="v" id="cfmAllowVal">0.0</span>
+      </button>
+      <button class="btn d" id="cfmAllowReset" style="margin-top:8px;display:none;text-align:center"
+        onclick="resetAllow()">自動計算に戻す</button>
+      <div class="note" id="cfmAllowNote"></div>
+    </div>
+    <div id="cfmWarn" style="margin-top:16px"></div>
+    <div class="whybox" id="cfmWhy" style="display:none;margin-top:20px">
+      <div class="lb">直す理由（事務所の修正履歴に残ります）</div>
+      <input type="text" id="cfmWhyIn" placeholder="例：時間を間違えて送った">
+    </div>
+    <div class="note" style="margin-top:20px" id="cfmNote">送信すると事務所に届きます・あとから直せます</div>
+    <button class="btn" style="margin-top:10px" id="btnSend" onclick="submitNippo()">送信する</button>
+    <button class="btn o sm" style="margin-top:10px" onclick="showScreen('scStep2')">直す（入力に戻る）</button>
+  </div>
+</div>
+
+<!-- ===================== 送信完了 ===================== -->
+<div id="scDone" class="screen">
+  <div class="bar-top"><span class="tt">送信完了</span></div>
+  <div class="wrap">
+    <div class="received" id="doneAt"></div>
+    <div class="done-h">送信しました</div>
+    <div style="font-size:15px;color:var(--muted)" id="doneSub"></div>
+    <div style="margin-top:6px;font-size:18px" id="doneJob"></div>
+    <div style="margin-top:6px;font-size:15px;color:var(--muted)" id="doneCnt"></div>
+    <button class="btn" style="margin-top:26px" onclick="continueNext()">続けてもう1件送る
+      <div style="font-size:13px;font-weight:400;margin-top:6px;color:rgba(243,242,242,.75)">日付・職長・メンバーはそのまま。工事と時間から入力（メンバーも変えられます）</div></button>
+    <button class="btn o" style="margin-top:12px" onclick="finishSend()">終わる</button>
+    <div class="note" style="margin-top:20px">午前A現場・午後B現場のように、1日に何件でも送れます。</div>
+  </div>
+</div>
+
+<!-- ===================== 工事一覧 ===================== -->
+<div id="scJobs" class="screen">
+  <div class="bar-top"><button class="bk" onclick="goTop()">戻る</button><span class="tt">工事一覧</span></div>
+  <div class="wrap">
+    <input type="text" id="jSearch" placeholder="注番・件名で検索">
+    <div class="fillrow" id="jFilters" style="margin-top:14px"></div>
+    <div class="flbl">担当でしぼる</div>
+    <div class="fillrow" id="jOwners" style="margin-bottom:16px"></div>
+    <div id="jWarn"></div>
+    <div style="font-size:13px;color:var(--faint);margin-bottom:10px" id="jCount"></div>
+    <div id="jList"></div>
+    <div class="note">注番に「工」「設」は付きません。区分（現場/工場/設計）は日報の入力で選びます。</div>
+  </div>
+</div>
+
+<!-- ===================== シート ===================== -->
+<div class="bd" id="bd" onclick="closeSheet()"></div>
+
+<div class="sheet" id="shCal">
+  <h2>日付を選ぶ</h2>
+  <div class="chips" style="margin-bottom:14px">
+    <button class="chip sm" onclick="pickToday()">今日</button>
+    <button class="chip sm" onclick="pickYesterday()">昨日</button>
+  </div>
+  <div class="calhd">
+    <button onclick="calMove(-1)">← 前の月</button>
+    <span class="m" id="calM"></span>
+    <button onclick="calMove(1)">次の月 →</button>
+  </div>
+  <div class="cal" id="calGrid"></div>
+  <div class="note">下線＝送信済みの日。先の日付は選べません。</div>
+  <button class="btn o sm" style="margin-top:14px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shForeman">
+  <h2>職長を選ぶ</h2>
+  <div class="ngrid" id="shForemanList"></div>
+  <button class="btn d" style="margin-top:12px" onclick="clearForeman()">空欄にする（職長なしで送る）</button>
+  <button class="btn o sm" style="margin-top:10px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shJob">
+  <h2>工事を選ぶ</h2>
+  <div class="chips" id="jobTabs" style="margin-bottom:12px"></div>
+  <div id="jobOwnWrap">
+    <div class="flbl" style="margin-top:0">担当でしぼる</div>
+    <div class="fillrow" id="jobOwners" style="margin-bottom:14px"></div>
+  </div>
+  <div id="jtNo">
+    <input type="text" id="jobSearch" placeholder="注番・件名で検索" style="margin-bottom:12px">
+    <div class="lbl" id="jobListLbl">最近使った工事</div>
+    <div id="jobList"></div>
+  </div>
+  <div id="jtFree" style="display:none">
+    <div class="lbl" style="margin-top:0">件名だけで登録されている工事</div>
+    <div class="note" style="margin-top:0;margin-bottom:10px">注番がまだ出ていない工事です。あとで事務所が注番を付けます。</div>
+    <div id="freeList"></div>
+  </div>
+  <div id="jtNew" style="display:none">
+    <div class="lbl" style="margin-top:0">件名を手で入力</div>
+    <input type="text" id="newJobName" placeholder="工事件名">
+    <button class="btn" style="margin-top:12px" onclick="commitNewJob()">この件名で決定</button>
+  </div>
+  <button class="btn o sm" style="margin-top:14px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shMember">
+  <h2>他の人を追加</h2>
+  <input type="text" id="memberSearch" placeholder="名前で検索">
+  <div class="note" style="margin-bottom:4px">名簿の全員（自社・常駐協力・外注協力）。タップで入切、選んだ人は上に足されます。</div>
+  <div id="memberAll"></div>
+  <div class="lbl">名簿にない応援</div>
+  <div class="chips" id="guestList" style="margin-bottom:10px"></div>
+  <input type="text" id="guestName" placeholder="＋ 応援の人を手で入力（他社・スポットの人）">
+  <button class="btn sm" style="margin-top:10px" onclick="addGuest()">追加する</button>
+  <div class="note">入れた人はこの日報だけに入ります。よく来る人は事務所に名簿へ追加してもらってください。</div>
+  <button class="btn o sm" style="margin-top:14px" onclick="closeSheet()">完了</button>
+</div>
+
+<div class="sheet" id="shOff">
+  <h2>休みの人を選ぶ</h2>
+  <div class="note" style="margin-top:0">選ぶと「休み」で入り、⑤メンバーからは自動で外れます。有給などはあとで選べます。</div>
+  <div id="offSelected" style="margin-top:14px"></div>
+  <div class="lbl">＋ 休みの人を追加</div>
+  <div class="mgtabs" id="offMGroups"></div>
+  <div id="offCandidates"></div>
+  <button class="btn o sm" style="margin-top:14px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shPad">
+  <h2 id="padTitle"></h2>
+  <div class="chips" id="padKinds" style="margin-bottom:10px"></div>
+  <button class="btn d sm" id="padMoreBtn" style="display:none;margin-bottom:10px" onclick="togglePadMore()"></button>
+  <div class="chips" id="padMoreKinds" style="display:none;margin-bottom:10px"></div>
+  <div class="padv" id="padVal">0</div>
+  <div class="chips" id="padQuick"></div>
+  <div class="pad" id="padKeys"></div>
+  <button class="btn" style="margin-top:12px" onclick="applyPad()">決定</button>
+  <button class="btn d" style="margin-top:10px;display:none;text-align:center" id="padReset" onclick="resetPerson()">全員分に戻す</button>
+  <button class="btn o sm" style="margin-top:10px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shDel">
+  <h2>この日報を消します</h2>
+  <div style="font-size:15px;color:var(--muted)" id="dlDate"></div>
+  <div style="font-size:19px;font-weight:600;margin-top:4px" id="dlJob"></div>
+  <div style="font-size:14px;color:var(--faint);margin-top:6px" id="dlSum"></div>
+  <div class="lbl">消す理由（事務所の修正履歴に残ります）</div>
+  <input type="text" id="dlWhy" placeholder="例：二重に送ってしまった">
+  <div class="note">この送信の全員分が消えます。消したことは事務所の修正履歴に残ります。元には戻せません。</div>
+  <button class="btn" style="margin-top:16px;background:var(--mag)" onclick="doDelete()">消す</button>
+  <button class="btn o sm" style="margin-top:10px" onclick="closeSheet()">やめる</button>
+</div>
+
+<!-- 平日の時間が1日の上限を超えるときは送らない。閉じると確認画面に戻る（入力はそのまま） -->
+<div class="sheet" id="shOver">
+  <h2>送れません</h2>
+  <div id="ovList"></div>
+  <div class="note">・残業なら「残業」の区分に入れてください<br>・送り直しなら、送信履歴の「直す」から変えてください</div>
+  <button class="btn o sm" style="margin-top:16px" onclick="closeSheet()">閉じる</button>
+</div>
+
+<div class="sheet" id="shClose">
+  <h2>この工事を閉じます</h2>
+  <div style="font-size:20px;font-weight:600" id="clNo"></div>
+  <div style="font-size:18px;margin-top:4px" id="clName"></div>
+  <div style="font-size:13px;color:var(--faint);margin-top:6px" id="clOwner"></div>
+  <div id="clFixed"></div>
+  <div class="note">今後の日報では選べなくなります。過去の日報はそのまま残ります。</div>
+  <button class="btn" style="margin-top:16px" onclick="doClose()">閉じる</button>
+  <button class="btn o sm" style="margin-top:10px" onclick="closeSheet()">やめる</button>
+</div>
+
+<script>
+/* ================== Firebase ================== */
+/* つなぐ先があれば Firebase、なければお試しモード（設定はこのファイルの上のほう） */
+const db = NIPPO_OPEN_DB();
+/* 会社名を画面に入れる（config.js の company） */
+document.title = "日報｜" + NIPPO.company;
+document.querySelectorAll("[data-co]").forEach(e=>{ e.textContent = NIPPO.company; });
+
+/* ================== 定数 ================== */
+const MAIN_KINDS = ["平日工場","平日現場","工場残業","現場残業"];
+const MORE_KINDS = ["休日工場","休日現場","移動行き","移動帰り","早出","深夜","突発"];
+const ALL_KINDS  = MAIN_KINDS.concat(MORE_KINDS);
+const PAPER_KINDS = ["平日工場","平日現場","休日工場","休日現場","工場残業","現場残業","移動行き","移動帰り","早出","深夜","突発"];
+const OT_KINDS   = ["工場残業","現場残業","早出","深夜"];
+const OFF_REASONS = ["休み","有給","欠勤","振休","特休"];
+const KUBUN = NIPPO.kubun;
+const CHECKS = ["出張","夜勤"];          /* 全員一律。遅刻・早退は人ごとに入れる */
+const MINUS_KINDS = ["遅刻","早退"];      /* 引く時間。人ごとのテンキーで入れる */
+const WD = ["日","月","火","水","木","金","土"];
+const YAKUIN = NIPPO.yakuin;
+const WORK_KINDS = ["平日工場","平日現場","休日工場","休日現場"];
+const MGROUPS = ["自社","常駐協力","外注協力"];
+const ALLOW_BORDER = 4;   /* 実働がこの時間以下なら 0.5 */
+/* 同じ人・同じ日の「平日」とつく区分の合計が、これを超えたら送らない。
+   管理画面の朝のチェック（kanri.html の CHK_LIMIT）と同じ数にしておくこと */
+const WEEKDAY_LIMIT = 8;
+const DAY_CHECK_WAIT = 6000;   /* その日の日報を読むのを待つ時間（ミリ秒）。過ぎたら確かめずに送る */
+const STALE_DAYS = 30;
+/* 読み込みの途中でも画面を切り替えられるように、ここで決めておく */
+const SCREENS=["scMe","scTop","scStep1","scStep2","scConfirm","scDone","scJobs","scHist"];
+
+/* ================== データ ================== */
+let WORKERS=[], JOBS=[], TEAMS={}, STATIONED=new Set(), CLOSED=[];
+let ALLDATA={}, LASTUSED={}, FREE_NAMES=[], SENT_DAYS=new Set();
+let ready=false;
+
+let S = {
+  date: todayStr(), foreman:null, job:null, jobFree:null, kubun:(KUBUN[0]||"現場"),
+  sel:[], off:[], guests:[], all:{}, ovr:{}, more:false, foremanAuto:false,
+  checks:{出張:false,夜勤:false}, late:{}, early:{},
+  jobTab:"fixed", jobOwner:"", pad:"0", padTarget:null, padMore:false, calY:0, calM:0, closeTarget:null,
+  mgOpen:{"自社":true,"常駐協力":false,"外注協力":false},
+  offMgOpen:{"自社":true,"常駐協力":false,"外注協力":false},
+  allow:0, allowE:false,
+  /* 送信履歴から直す・消すとき */
+  mode:"new", editBatch:null, editYm:null, editAt:"", editB:null, orig:null,
+  /* 直しているとき、その日報を最初に送った人。空なら今の端末の名前を入れる */
+  sentBy:"",
+  delB:null, flash:""
+};
+
+/* この端末を使う人。確認アプリと同じ鍵を使う（同じ場所に置いてあるので共通） */
+const ME_KEY = NIPPO.storagePrefix + ".me";
+let ME = "";
+try{ ME = localStorage.getItem(ME_KEY) || ""; }catch(e){ ME = ""; }
+let meCanCancel = false;
+let HIST = [];
+
+/* ================== 小道具 ================== */
+function todayStr(){ const d=new Date();
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
+function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function isKana(s){ return /^[ァ-ヴー]+$/.test(s); }
+function byLen(a,b){ return (isKana(a)-isKana(b))||(a.length-b.length)||a.localeCompare(b,"ja"); }
+function fmt(v){ return v ? Number(v).toFixed(1) : "−"; }
+function f1(v){ return (Math.round((v||0)*10)/10).toFixed(1); }
+function r1(v){ return Math.round((v||0)*10)/10; }
+function totalOf(h){ h=h||{}; return ALL_KINDS.reduce((a,k)=>a+(h[k]||0),0); }
+function hoursFor(n){ return S.ovr[n] || S.all; }
+/* 遅刻・早退は人ごと */
+function lateFor(n){ return S.late[n]||0; }
+function earlyFor(n){ return S.early[n]||0; }
+function minusFor(n){ return lateFor(n)+earlyFor(n); }
+/* その人の差引後の時間 */
+function netFor(n){ return Math.max(0, totalOf(hoursFor(n)) - minusFor(n)); }
+/* その人に何か個別の入力があるか（時間の上書き・遅刻・早退） */
+function hasOwn(n){ return !!S.ovr[n] || !!S.late[n] || !!S.early[n]; }
+/* 1人ぶんの内訳を、同じくらいの大きさで横に並べる */
+function brkFor(n){
+  const h=hoursFor(n);
+  const p=PAPER_KINDS.filter(k=>h[k]).map(k=>'<span>'+esc(k)+' '+f1(h[k])+'</span>');
+  if(S.late[n])  p.push('<span class="mn">遅刻 −'+f1(S.late[n])+'</span>');
+  if(S.early[n]) p.push('<span class="mn">早退 −'+f1(S.early[n])+'</span>');
+  return p.length ? p.join('<span class="sep">／</span>') : '<span class="z">未入力</span>';
+}
+function netOf(r){ return Math.max(0, totalOf(r.h)-(r.late||0)-(r.early||0)); }
+function dLabel(ds){ const d=new Date(ds+"T00:00:00");
+  return isNaN(d)?ds:(d.getFullYear()+"年"+(d.getMonth()+1)+"月"+d.getDate()+"日（"+WD[d.getDay()]+"）"); }
+function dShort(ds){ const d=new Date(ds+"T00:00:00");
+  return isNaN(d)?ds:((d.getMonth()+1)+"/"+d.getDate()+"（"+WD[d.getDay()]+"）"); }
+function daysAgo(ds){ if(!ds) return null;
+  const a=new Date(ds+"T00:00:00"), b=new Date(todayStr()+"T00:00:00");
+  return isNaN(a)?null:Math.round((b-a)/86400000); }
+function agoLabel(d){ return d===null?"使用なし":d===0?"今日に使用":d===1?"昨日に使用":d+"日前に使用"; }
+/* ---- 工期 ---- */
+function daysUntil(ds){ if(!ds) return null;
+  const a=new Date(ds+"T00:00:00"), b=new Date(todayStr()+"T00:00:00");
+  return isNaN(a)?null:Math.round((a-b)/86400000); }
+/* null=通常 / "amber"=終了7日前から / "red"=終了当日から または1か月未使用 */
+function jobAlert(j){
+  if(!j||j.fixed) return null;
+  if(j.end){
+    const d=daysUntil(j.end);
+    if(d===null) return null;
+    if(d<=0) return "red";
+    if(d<=7) return "amber";
+    return null;
+  }
+  const u=daysAgo(LASTUSED[j.no]);
+  return (u!==null&&u>STALE_DAYS) ? "red" : null;
+}
+function isStale(j){ return jobAlert(j)!==null; }
+function alertTx(j){
+  const a=jobAlert(j);
+  if(a==="red")   return j.end ? (daysUntil(j.end)===0?"工期 本日まで":"工期 "+(-daysUntil(j.end))+"日超過") : "1か月以上なし";
+  if(a==="amber") return "工期 あと"+daysUntil(j.end)+"日";
+  return "";
+}
+function dOnly2(ds){ const d=new Date(ds+"T00:00:00");
+  return isNaN(d)?ds:((d.getMonth()+1)+"/"+d.getDate()); }
+function termTx(j){
+  if(!j.start&&!j.end) return "";
+  return "工期 "+(j.start?dOnly2(j.start):"―")+"〜"+(j.end?dOnly2(j.end):"―");
+}
+
+/* ---- 名簿の3グループ（旧データの「協力」は「常駐協力」として扱う） ---- */
+function mGroupOf(w){
+  if(!w) return "自社";
+  if(w.kubun==="自社") return "自社";
+  if(w.kubun==="外注協力") return "外注協力";
+  return "常駐協力";
+}
+function activeWorkers(){ return WORKERS.filter(w=>w.active!==false); }
+function selfNames(){ return activeWorkers().filter(w=>mGroupOf(w)==="自社").map(w=>w.name); }
+function groupNames(g){ return activeWorkers().filter(w=>mGroupOf(w)===g).map(w=>w.name).sort(byLen); }
+function groupOfName(n){
+  const w=WORKERS.find(x=>x.name===n);
+  if(w) return mGroupOf(w);
+  return S.guests.indexOf(n)>=0 ? "応援" : "自社";
+}
+function partnerGroups(){ const g={};
+  activeWorkers().filter(w=>mGroupOf(w)!=="自社").forEach(w=>{ (g[w.shozoku]=g[w.shozoku]||[]).push(w.name); });
+  return g; }
+
+/* ---- 職長手当（工数） ---- */
+/* 実働＝平日/休日の工場・現場の合計から遅刻・早退を引いたもの */
+function workNetFor(n){
+  const h=hoursFor(n);
+  const w=WORK_KINDS.reduce((a,k)=>a+(h[k]||0),0)-minusFor(n);
+  return Math.max(0,w);
+}
+/* 本人も数える。役員7名は数えない。休みの人（S.off）は入らない。
+   実働が0の人（移動・残業だけの日）も数えない。
+   実働が少しでもあれば、4時間以下は0.5、それより上は1.0 */
+function autoAllow(){
+  return S.sel.reduce((a,n)=>{
+    if(YAKUIN.indexOf(n)>=0) return a;
+    const w=workNetFor(n);
+    if(w<=0) return a;
+    return a + (w<=ALLOW_BORDER ? 0.5 : 1);
+  },0);
+}
+function allowNow(){ return S.allowE ? S.allow : autoAllow(); }
+function allowTx(v){ return (Math.round((v||0)*10)/10).toFixed(1); }
+function monthRows(m){ return (ALLDATA[m]&&ALLDATA[m].rows)?ALLDATA[m].rows.filter(Boolean):[]; }
+function allRows(){ return Object.keys(ALLDATA).reduce((a,m)=>a.concat(monthRows(m)),[]); }
+function jobKey(r){ return r.no || r.j || ""; }
+function openJobs(){ return JOBS.filter(j=>j.active!==false && CLOSED.indexOf(j.no)<0); }
+function curYm(){ return todayStr().slice(0,7); }
+/* 内訳がおなじ内容かどうかを見るための文字列 */
+function hKey(h){ h=h||{}; return ALL_KINDS.filter(k=>h[k]).map(k=>k+":"+r1(h[k])).join(","); }
+/* batch が付いていない古い行のための組み分け */
+function rowBatchKey(r){ return r.batch || (r.d+"|"+jobKey(r)); }
+function inBatch(r,b){
+  return b.batch ? r.batch===b.batch
+    : (rowBatchKey(r)===b.key && (r.f||"")===(b.rows[0].f||""));
+}
+function stampNow(){ const n=new Date();
+  return (n.getMonth()+1)+"/"+n.getDate()+" "+
+    String(n.getHours()).padStart(2,"0")+":"+String(n.getMinutes()).padStart(2,"0"); }
+/* 事務所の修正履歴（管理画面と同じ形）に残す */
+function pushLog(what, why, ym){
+  return db.ref("log").push({ t:stampNow(), who:ME||"（名前が未登録の端末）",
+    ym:ym||curYm(), what:what, why:why||"（理由なし）" });
+}
+
+/* ================== 読み込み ================== */
+db.ref("master").on("value", snap=>{
+  const v=snap.val()||{};
+  WORKERS=Object.values(v.workers||{});
+  JOBS=Object.values(v.jobs||{});
+  CLOSED=v.closed?Object.values(v.closed):[];
+  TEAMS={}; Object.values(v.teams||{}).forEach(t=>{ if(t&&t.name) TEAMS[t.name]=t.members||[]; });
+  STATIONED=new Set(Object.keys(TEAMS).reduce((a,k)=>a.concat(TEAMS[k]),[]));
+  ready=true;
+  if(!S.sel.length) applyTeam();
+  renderAll();
+  /* 名前がまだなら、まずそれを選んでもらう */
+  if(!ME) openMe(false);
+  else if(document.getElementById("scMe").classList.contains("on")) renderMeList();
+});
+db.ref("nippo").on("value", snap=>{
+  ALLDATA=snap.val()||{};
+  const last={}, free=new Set(), sd=new Set();
+  allRows().forEach(r=>{
+    if(r.no&&r.d&&(!last[r.no]||r.d>last[r.no])) last[r.no]=r.d;
+    if(!r.no&&r.j) free.add(r.j);
+    if(r.d) sd.add(r.d);
+  });
+  LASTUSED=last; FREE_NAMES=[...free].slice(0,20); SENT_DAYS=sd;
+  renderAll();
+});
+
+/* ================== 画面遷移 ================== */
+function showScreen(id){
+  SCREENS.forEach(x=>document.getElementById(x).classList.toggle("on", x===id));
+  window.scrollTo(0,0);
+}
+function goTop(){ S.flash=""; showScreen("scTop"); renderTop(); }
+function goSend(){ if(S.mode==="edit") resetInput(); S.flash=""; showScreen("scStep1"); renderAll(); }
+function goJobs(){ S.flash=""; showScreen("scJobs"); renderJobsPage(); }
+function goStep2(){ if(!canStep2()) return; showScreen("scStep2"); renderAll(); }
+/* 入力画面から戻る。直している最中なら履歴へ戻す */
+function leaveInput(){
+  if(S.mode==="edit"){ resetInput(); showScreen("scHist"); renderHist(); return; }
+  goTop();
+}
+
+/* ================== この端末の名前 ================== */
+function saveMe(n){ ME=n; try{ localStorage.setItem(ME_KEY,n); }catch(e){} }
+function openMe(canCancel){
+  meCanCancel=!!canCancel;
+  document.getElementById("meCancel").style.display=meCanCancel?"block":"none";
+  document.getElementById("meSub").textContent=meCanCancel
+    ? "この端末を使う人を選び直します。今は「"+(ME||"未登録")+"」です。"
+    : "この端末を使う人を1回だけ登録します。次からは聞きません。あとから変えられます。";
+  showScreen("scMe"); renderMeList();
+}
+function renderMeList(){
+  const el=document.getElementById("meList");
+  if(!ready){ el.innerHTML='<div class="note" style="margin-top:0">名簿を読み込んでいます…</div>'; return; }
+  const q=(document.getElementById("meSearch").value||"").trim();
+  let html="";
+  MGROUPS.forEach(g=>{
+    const l=groupNames(g).filter(n=>!q||n.indexOf(q)>=0);
+    if(!l.length) return;
+    html+='<div class="step">'+esc(g)+'</div><div class="ngrid" style="margin-bottom:18px">'+
+      l.map(n=>'<button class="nchip'+(ME===n?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+'</button>').join("")+
+      '</div>';
+  });
+  el.innerHTML=html||'<div class="note" style="margin-top:0">該当する名前がありません</div>';
+  document.querySelectorAll("#meList .nchip").forEach(b=>{
+    b.onclick=()=>{ saveMe(b.dataset.n); goTop(); };
+  });
+}
+document.getElementById("meSearch").addEventListener("input", renderMeList);
+
+/* ================== シート ================== */
+let openedSheet=null;
+function openSheet(name){
+  const map={cal:"shCal",foreman:"shForeman",job:"shJob",member:"shMember",off:"shOff",pad:"shPad",
+             close:"shClose",del:"shDel",over:"shOver"};
+  const id=map[name]; if(!id) return;
+  openedSheet=id;
+  document.getElementById(id).classList.add("on");
+  document.getElementById("bd").classList.add("on");
+  if(name==="cal") renderCal();
+  if(name==="foreman") renderForemanSheet();
+  if(name==="job"){ S.jobOwner=""; renderJobSheet(); }   /* 開くたびに担当のしぼり込みは外す */
+  if(name==="member") renderMemberSheet();
+  if(name==="off") renderOffSheet();
+}
+function closeSheet(){
+  if(openedSheet) document.getElementById(openedSheet).classList.remove("on");
+  document.getElementById("bd").classList.remove("on");
+  openedSheet=null; S.padTarget=null; S.closeTarget=null;
+}
+
+/* ================== トップ ================== */
+function renderTop(){
+  document.getElementById("topDate").textContent=dLabel(todayStr());
+  document.getElementById("topJobsSub").textContent="注番と件名を調べる（"+openJobs().length+"件）";
+  const mb=document.getElementById("topMe");
+  mb.style.display=ME?"flex":"none";
+  document.getElementById("topMeName").textContent=ME?ME+" さん":"";
+  document.getElementById("topHistSub").textContent=ME
+    ? "今月 "+ME+"さんが送った日報 "+myBatches().length+"件 ─ 直す・消す・同じ内容で送る"
+    : "先にお名前を登録してください";
+  const rows=allRows().filter(r=>!r.off).sort((a,b)=>
+    String(b.d).localeCompare(String(a.d)) || String(b.at||"").localeCompare(String(a.at||"")));
+  const el=document.getElementById("topLast");
+  if(!rows.length){ el.innerHTML=""; return; }
+  const r=rows[0];
+  const same=rows.filter(x=>x.d===r.d && (x.batch?x.batch===r.batch:jobKey(x)===jobKey(r)));
+  el.innerHTML="前回送信：" + dShort(r.d) + "<br>" +
+    (r.no?'<span class="no">'+esc(r.no)+"</span> ":"") + esc(r.j||"") + " ・ " + same.length + "人";
+}
+
+/* ================== 入力 全体 ================== */
+function renderAll(){
+  if(!ready) return;
+  renderTop(); renderDate(); renderForeman(); renderJob(); renderKubun();
+  renderMembers(); renderOff(); renderTimes(); renderPersons(); renderChecks(); renderStepBtns();
+  if(document.getElementById("scJobs").classList.contains("on")) renderJobsPage();
+  if(document.getElementById("scHist").classList.contains("on")) renderHist();
+  document.getElementById("ttStep1").textContent=S.mode==="edit"?"送った日報を直す":"日報を送る";
+}
+
+/* ---- 日付 ---- */
+function renderDate(){ document.getElementById("fDate").textContent=dLabel(S.date); }
+function pickToday(){ S.date=todayStr(); closeSheet(); renderAll(); }
+function pickYesterday(){
+  const d=new Date(); d.setDate(d.getDate()-1);
+  S.date=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+  closeSheet(); renderAll();
+}
+function calMove(n){
+  let y=S.calY, m=S.calM+n;
+  if(m<0){ m=11; y--; } if(m>11){ m=0; y++; }
+  S.calY=y; S.calM=m; renderCal();
+}
+function renderCal(){
+  const cur=new Date(S.date+"T00:00:00");
+  if(!S.calY){ S.calY=cur.getFullYear(); S.calM=cur.getMonth(); }
+  const y=S.calY, m=S.calM;
+  document.getElementById("calM").textContent=y+"年 "+(m+1)+"月";
+  const first=new Date(y,m,1).getDay();
+  const last=new Date(y,m+1,0).getDate();
+  const today=todayStr();
+  let html=WD.map((d,i)=>'<div class="wd'+(i===0?" sun":i===6?" sat":"")+'">'+d+'</div>').join("");
+  for(let i=0;i<first;i++) html+='<button class="na"></button>';
+  for(let d=1;d<=last;d++){
+    const ds=y+"-"+String(m+1).padStart(2,"0")+"-"+String(d).padStart(2,"0");
+    const dow=new Date(y,m,d).getDay();
+    const cls=["","sun","","","","","",""][dow===0?1:0];
+    const future=ds>today;
+    html+='<button class="'+(dow===0?"sun ":"")+(SENT_DAYS.has(ds)?"sent ":"")+(S.date===ds?"on":"")+'"'+
+      (future?" disabled":"")+' data-d="'+ds+'">'+d+'</button>';
+  }
+  document.getElementById("calGrid").innerHTML=html;
+  document.querySelectorAll("#calGrid button[data-d]").forEach(b=>{
+    if(b.disabled) return;
+    b.onclick=()=>{ S.date=b.dataset.d; closeSheet(); renderAll(); };
+  });
+}
+
+/* ---- 職長 ---- */
+function renderForeman(){
+  document.getElementById("fForeman").textContent=S.foreman||"職長なし（空欄のまま送る）";
+  document.getElementById("fForeman").className="big"+(S.foreman?"":" off");
+  document.getElementById("cForeman").classList.toggle("on",!!S.foreman);
+}
+function renderForemanSheet(){
+  document.getElementById("shForemanList").innerHTML=selfNames().sort(byLen).map(n=>
+    '<button class="nchip'+(S.foreman===n?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+'</button>').join("");
+  document.querySelectorAll("#shForemanList .nchip").forEach(b=>{
+    b.onclick=()=>{
+      const prev = S.foreman;
+      const n = b.dataset.n;
+      S.foreman = n;
+      // 前の職長が「自動で入っただけ」なら外す
+      if(prev && prev!==n && S.foremanAuto && S.sel.indexOf(prev)>=0){
+        S.sel = S.sel.filter(x=>x!==prev);
+      }
+      // 新しい職長をメンバーに入れる（休みの人は入れない）
+      if(S.sel.indexOf(n)<0 && !S.off.some(o=>o.name===n)){
+        S.sel = S.sel.concat([n]);
+        S.foremanAuto = true;
+      } else {
+        S.foremanAuto = false;
+      }
+      closeSheet(); renderAll();
+    };
+  });
+}
+function clearForeman(){
+  if(S.foreman && S.foremanAuto) S.sel = S.sel.filter(x=>x!==S.foreman);
+  S.foreman=null; S.foremanAuto=false; closeSheet(); renderAll();
+}
+
+/* ---- 工事 ---- */
+function renderJob(){
+  const j=JOBS.find(x=>x.no===S.job);
+  document.getElementById("fJobNo").textContent=S.job||"注番なし";
+  document.getElementById("fJobNo").className="no"+(S.job?"":" none");
+  document.getElementById("fJobNm").textContent=j?j.name:(S.jobFree||"");
+  document.getElementById("cJob").classList.toggle("on",!!(S.job||S.jobFree));
+}
+function renderJobSheet(){
+  const tabs=[{k:"fixed",l:"常設"},{k:"no",l:"注番あり"},{k:"free",l:"注番なし"},{k:"new",l:"新しい件名"}];
+  document.getElementById("jobTabs").innerHTML=tabs.map(t=>
+    '<button class="chip sm'+(S.jobTab===t.k?" on":"")+'" data-k="'+t.k+'">'+t.l+'</button>').join("");
+  document.querySelectorAll("#jobTabs .chip").forEach(b=>{
+    b.onclick=()=>{ S.jobTab=b.dataset.k; S.jobOwner=""; renderJobSheet(); };
+  });
+  const showList=(S.jobTab==="fixed"||S.jobTab==="no");
+
+  /* 担当でしぼる。工事一覧・注番管理と同じ見た目、同じ並び（件数の多い順） */
+  document.getElementById("jobOwnWrap").style.display=showList?"block":"none";
+  const base=openJobs().filter(j=>S.jobTab==="fixed"?!!j.fixed:!j.fixed);
+  const oc={};
+  base.forEach(j=>{ if(j.owner) oc[j.owner]=(oc[j.owner]||0)+1; });
+  const owners=Object.keys(oc).sort((a,b)=>(oc[b]-oc[a])||a.localeCompare(b,"ja"));
+  document.getElementById("jobOwners").innerHTML=
+    '<button class="chip sm'+(S.jobOwner?"":" on")+'" data-o="">すべて<span class="n">'+base.length+'</span></button>'+
+    owners.map(o=>'<button class="chip sm'+(S.jobOwner===o?" on":"")+'" data-o="'+esc(o)+'">'+
+      esc(o)+'<span class="n">'+oc[o]+'</span></button>').join("");
+  document.querySelectorAll("#jobOwners .chip").forEach(b=>{
+    b.onclick=()=>{ S.jobOwner=b.dataset.o; renderJobSheet(); };
+  });
+  document.getElementById("jtNo").style.display=showList?"block":"none";
+  document.getElementById("jtFree").style.display=S.jobTab==="free"?"block":"none";
+  document.getElementById("jtNew").style.display=S.jobTab==="new"?"block":"none";
+  document.getElementById("jobListLbl").textContent=S.jobTab==="fixed"?"年間を通して使う注番":"最近使った工事";
+
+  const q=(document.getElementById("jobSearch").value||"").trim();
+  const list=base
+    .filter(j=>!S.jobOwner||(j.owner||"")===S.jobOwner)
+    .filter(j=>!q||(j.no+" "+j.name).indexOf(q)>=0)
+    .sort((a,b)=>{
+      if(S.jobTab==="fixed") return String(a.no).localeCompare(String(b.no));
+      const da=daysAgo(LASTUSED[a.no]), dbv=daysAgo(LASTUSED[b.no]);
+      if(da===null&&dbv===null) return String(a.no).localeCompare(String(b.no));
+      if(da===null) return 1; if(dbv===null) return -1;
+      return da-dbv;
+    });
+  document.getElementById("jobList").innerHTML=list.length?list.map(j=>{
+    const al=jobAlert(j), on=S.job===j.no;
+    const col=al==="red"?"var(--mag-d)":al==="amber"?"var(--amber)":"";
+    const tm=termTx(j);
+    return '<button class="job'+(on?" on":"")+'" data-no="'+esc(j.no)+'">'+
+      '<div class="no"'+(col?' style="color:'+col+'"':'')+'>'+esc(j.no)+'</div>'+
+      '<div class="nm">'+esc(j.name)+'</div>'+
+      (j.fixed?'<div class="badge">常設</div>':'')+
+      (al?'<div class="badge" style="background:'+(al==="red"?"var(--mag-bg)":"var(--amber-bg)")+
+          ';color:'+col+'">'+esc(alertTx(j))+'</div>':'')+
+      '<div class="mt">担当 '+esc(j.owner||"―")+' ／ '+agoLabel(daysAgo(LASTUSED[j.no]))+
+        (tm?' ／ '+esc(tm):'')+'</div></button>';
+  }).join(""):'<div class="note">該当する工事がありません</div>';
+  document.querySelectorAll("#jobList .job").forEach(b=>{
+    b.onclick=()=>{ S.job=b.dataset.no; S.jobFree=null; closeSheet(); renderAll(); };
+  });
+
+  document.getElementById("freeList").innerHTML=FREE_NAMES.length?
+    FREE_NAMES.map(n=>'<button class="job'+(S.jobFree===n?" on":"")+'" data-n="'+esc(n)+'">'+
+      '<div class="nm">'+esc(n)+'</div></button>').join("")
+    :'<div class="note">まだ履歴がありません。「新しい件名」から入力してください。</div>';
+  document.querySelectorAll("#freeList .job").forEach(b=>{
+    b.onclick=()=>{ S.jobFree=b.dataset.n; S.job=null; closeSheet(); renderAll(); };
+  });
+}
+document.getElementById("jobSearch").addEventListener("input", renderJobSheet);
+function commitNewJob(){
+  const t=(document.getElementById("newJobName").value||"").trim(); if(!t) return;
+  S.jobFree=t; S.job=null;
+  document.getElementById("newJobName").value="";
+  closeSheet(); renderAll();
+}
+
+/* ---- 区分 ---- */
+function renderKubun(){
+  document.getElementById("fKubun").innerHTML=KUBUN.map(k=>
+    '<button class="chip'+(S.kubun===k?" on":"")+'" data-k="'+esc(k)+'">'+esc(k)+'</button>').join("");
+  document.querySelectorAll("#fKubun .chip").forEach(b=>{
+    b.onclick=()=>{
+      S.kubun=b.dataset.k;
+      S.mgOpen["自社"]=true;   /* どの区分でも自社は開いた状態 */
+      /* 直しているときは、区分を直してもメンバーを入れ替えない */
+      if(S.mode!=="edit") applyTeam();
+      renderAll();
+    };
+  });
+}
+function applyTeam(){
+  const t=TEAMS[S.kubun];
+  if(t&&t.length){
+    S.sel=t.filter(n=>!S.off.some(o=>o.name===n));
+    // 職長が自動で入っていたなら、班を切り替えても残す
+    if(S.foreman && S.foremanAuto && S.sel.indexOf(S.foreman)<0
+       && !S.off.some(o=>o.name===S.foreman)){
+      S.sel=S.sel.concat([S.foreman]);
+    }
+  }
+}
+
+/* ---- メンバー ---- */
+/* 「自社」グループに出す名前。区分に班があればその常任メンバー、
+   なければ常駐を除いた自社。選んだ人・休みの人は必ず出す。 */
+function rosterNames(){
+  const t=TEAMS[S.kubun];
+  const base=(t&&t.length)?t.slice():selfNames().filter(n=>!STATIONED.has(n));
+  const extra=selfNames().filter(n=>S.sel.indexOf(n)>=0||S.off.some(o=>o.name===n));
+  return [...new Set(base.concat(extra))].sort(byLen);
+}
+/* グループごとに出す名前 */
+function namesForGroup(g){
+  if(g==="自社") return rosterNames();
+  const all=groupNames(g);
+  const guests=(g==="常駐協力") ? S.guests : [];
+  return [...new Set(all.concat(guests))].sort(byLen);
+}
+function selCountIn(g){
+  return S.sel.filter(n=>{
+    const gg=groupOfName(n);
+    return gg===g || (g==="常駐協力" && gg==="応援");
+  }).length;
+}
+function chipHtml(n){
+  const isOff=S.off.some(o=>o.name===n), on=S.sel.indexOf(n)>=0;
+  return '<button class="nchip'+(isOff?" rest":on?" on":"")+'" data-n="'+esc(n)+'">'+
+    esc(n)+(isOff?"・休":"")+'</button>';
+}
+function renderMembers(){
+  /* 3つの開閉ボタン */
+  document.getElementById("fMGroups").innerHTML=MGROUPS.map(g=>{
+    const c=selCountIn(g), n=namesForGroup(g).length;
+    return '<button class="mgtab'+(S.mgOpen[g]?" open":"")+'" data-g="'+esc(g)+'">'+
+      '<span class="g">'+esc(g)+'</span>'+
+      '<span class="c'+(c?" has":"")+'">'+(c?c+"人選択中":(n?n+"人":"名簿なし"))+'</span></button>';
+  }).join("");
+  document.querySelectorAll("#fMGroups .mgtab").forEach(b=>{
+    b.onclick=()=>{ const g=b.dataset.g; S.mgOpen[g]=!S.mgOpen[g]; renderMembers(); };
+  });
+
+  /* 開いているグループだけ名前を出す */
+  let html="";
+  MGROUPS.forEach(g=>{
+    const names=namesForGroup(g);
+    const picked=S.sel.filter(n=>{
+      const gg=groupOfName(n);
+      return gg===g || (g==="常駐協力" && gg==="応援");
+    });
+    if(!S.mgOpen[g]){
+      /* 閉じていても、選んでいる人は名前で分かるようにする */
+      if(picked.length) html+='<div class="mgpick">'+esc(g)+'：'+picked.map(esc).join("・")+'</div>';
+      return;
+    }
+    html+='<div class="mgsec"><div class="lbl2">'+esc(g)+'</div>';
+    if(!names.length){
+      html+='<div class="note" style="margin-top:0">'+
+        (g==="外注協力"
+          ? "外注協力の名簿はまだ登録されていません。名簿が届いたら事務所が登録します。"
+          : "この区分に出す名前がありません。")+'</div>';
+    } else {
+      html+='<div class="ngrid">'+names.map(chipHtml).join("")+'</div>';
+    }
+    html+='</div>';
+  });
+  document.getElementById("fMembersWrap").innerHTML=html;
+  document.querySelectorAll("#fMembersWrap .nchip").forEach(b=>{
+    b.onclick=()=>{ toggleSel(b.dataset.n); renderAll(); };
+  });
+
+  document.getElementById("fSelN").textContent=S.sel.length?"（"+S.sel.length+"人）":"";
+  const t=TEAMS[S.kubun];
+  document.getElementById("fRosterNote").textContent=(t&&t.length)
+    ? S.kubun+"の常任メンバーを「自社」に出しています。ここに出ていない人は「他の人を追加」から。"
+    : "工場・設計・緑化の常任メンバーは隠しています。「他の人を追加」から呼べます。";
+}
+function toggleSel(n){
+  if(S.sel.indexOf(n)>=0){
+    S.sel=S.sel.filter(x=>x!==n);
+    if(n===S.foreman) S.foremanAuto=false;   // 職長を手で外した＝事務所作業など
+  } else {
+    S.sel=S.sel.concat([n]); S.off=S.off.filter(o=>o.name!==n);
+  }
+}
+function renderMemberSheet(){
+  const q=(document.getElementById("memberSearch").value||"").trim();
+  const hit=n=>!q||n.indexOf(q)>=0;
+  let html="";
+  MGROUPS.forEach(g=>{
+    if(g==="自社"){
+      const l=selfNames().filter(hit).sort(byLen);
+      if(!l.length) return;
+      html+='<div class="lbl">自社</div><div class="ngrid">'+
+        l.map(n=>'<button class="nchip'+(S.sel.indexOf(n)>=0?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+'</button>').join("")+'</div>';
+      return;
+    }
+    /* 協力は会社ごとに */
+    const cos={};
+    activeWorkers().filter(w=>mGroupOf(w)===g).forEach(w=>{ (cos[w.shozoku||"所属なし"]=cos[w.shozoku||"所属なし"]||[]).push(w.name); });
+    const keys=Object.keys(cos).sort((a,b)=>a.localeCompare(b,"ja"));
+    if(!keys.length){
+      if(!q) html+='<div class="lbl">'+esc(g)+'</div><div class="note" style="margin-top:0">'+
+        (g==="外注協力"?"名簿はまだ登録されていません。":"登録がありません。")+'</div>';
+      return;
+    }
+    let inner="";
+    keys.forEach(co=>{
+      const l=cos[co].filter(hit).sort(byLen);
+      if(!l.length) return;
+      inner+='<div class="lbl">'+esc(g)+' ─ '+esc(co)+'</div><div class="ngrid">'+
+        l.map(n=>'<button class="nchip'+(S.sel.indexOf(n)>=0?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+'</button>').join("")+'</div>';
+    });
+    html+=inner;
+  });
+  document.getElementById("memberAll").innerHTML=html||'<div class="note">該当する名前がありません</div>';
+  document.querySelectorAll("#memberAll .nchip").forEach(b=>{
+    b.onclick=()=>{ toggleSel(b.dataset.n); renderMemberSheet(); renderAll(); };
+  });
+  document.getElementById("guestList").innerHTML=S.guests.map(n=>
+    '<button class="chip sm'+(S.sel.indexOf(n)>=0?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+' ×</button>').join("");
+  document.querySelectorAll("#guestList .chip").forEach(b=>{
+    b.onclick=()=>{ const n=b.dataset.n;
+      S.guests=S.guests.filter(x=>x!==n); S.sel=S.sel.filter(x=>x!==n);
+      renderMemberSheet(); renderAll(); };
+  });
+}
+document.getElementById("memberSearch").addEventListener("input", renderMemberSheet);
+function addGuest(){
+  const t=(document.getElementById("guestName").value||"").trim();
+  if(!t||S.guests.indexOf(t)>=0) return;
+  S.guests.push(t); S.sel.push(t);
+  document.getElementById("guestName").value="";
+  renderMemberSheet(); renderAll();
+}
+
+/* ---- 休み ---- */
+function renderOff(){
+  const txt=S.off.length?S.off.map(o=>o.name+"（"+o.reason+"）").join("・"):"なし";
+  document.getElementById("fOff").textContent=txt;
+  document.getElementById("fOff").className="big"+(S.off.length?"":" off");
+  document.getElementById("cOff").classList.toggle("on",S.off.length>0);
+}
+/* 休みの候補もメンバーと同じ3グループで出す（応援は「常駐協力」に入れる） */
+function inOffGroup(n,g){
+  const gg=groupOfName(n);
+  return gg===g || (g==="常駐協力" && gg==="応援");
+}
+function offNamesForGroup(g){
+  if(g==="自社") return selfNames().sort(byLen);
+  const all=groupNames(g);
+  const guests=(g==="常駐協力") ? S.guests : [];
+  return [...new Set(all.concat(guests))].sort(byLen);
+}
+function offCountIn(g){ return S.off.filter(o=>inOffGroup(o.name,g)).length; }
+function renderOffSheet(){
+  document.getElementById("offSelected").innerHTML=S.off.map(o=>
+    '<div class="offitem"><div class="hd"><span class="nm">'+esc(o.name)+'</span>'+
+    '<button class="chip sm" data-rm="'+esc(o.name)+'">外す</button></div><div class="rs">'+
+    OFF_REASONS.map(r=>'<button class="chip'+(o.reason===r?" on":"")+'" data-n="'+esc(o.name)+'" data-r="'+esc(r)+'">'+r+'</button>').join("")+
+    '</div></div>').join("");
+  document.querySelectorAll("#offSelected [data-rm]").forEach(b=>{
+    b.onclick=()=>{ S.off=S.off.filter(o=>o.name!==b.dataset.rm); renderOffSheet(); renderAll(); };
+  });
+  document.querySelectorAll("#offSelected [data-r]").forEach(b=>{
+    b.onclick=()=>{ S.off=S.off.map(o=>o.name===b.dataset.n?{name:o.name,reason:b.dataset.r}:o);
+      renderOffSheet(); renderAll(); };
+  });
+  /* 3つの開閉ボタン（⑤メンバーと同じ見た目・同じ操作） */
+  document.getElementById("offMGroups").innerHTML=MGROUPS.map(g=>{
+    const c=offCountIn(g), n=offNamesForGroup(g).length;
+    return '<button class="mgtab'+(S.offMgOpen[g]?" open":"")+'" data-g="'+esc(g)+'">'+
+      '<span class="g">'+esc(g)+'</span>'+
+      '<span class="c'+(c?" has":"")+'">'+(c?c+"人休み":(n?n+"人":"名簿なし"))+'</span></button>';
+  }).join("");
+  document.querySelectorAll("#offMGroups .mgtab").forEach(b=>{
+    b.onclick=()=>{ const g=b.dataset.g; S.offMgOpen[g]=!S.offMgOpen[g]; renderOffSheet(); };
+  });
+
+  /* 開いているグループだけ名前を出す */
+  let html="";
+  MGROUPS.forEach(g=>{
+    const names=offNamesForGroup(g);
+    const picked=S.off.filter(o=>inOffGroup(o.name,g)).map(o=>o.name);
+    if(!S.offMgOpen[g]){
+      /* 閉じていても、休みの人は名前で分かるようにする */
+      if(picked.length) html+='<div class="mgpick">'+esc(g)+'：'+picked.map(esc).join("・")+'</div>';
+      return;
+    }
+    html+='<div class="mgsec"><div class="lbl2">'+esc(g)+'</div>';
+    if(!names.length){
+      html+='<div class="note" style="margin-top:0">'+
+        (g==="外注協力"
+          ? "外注協力の名簿はまだ登録されていません。名簿が届いたら事務所が登録します。"
+          : "この区分に出す名前がありません。")+'</div>';
+    } else {
+      html+='<div class="ngrid">'+names.map(n=>{
+        const on=S.off.some(o=>o.name===n);
+        return '<button class="nchip'+(on?" on":"")+'" data-n="'+esc(n)+'">'+esc(n)+'</button>';
+      }).join("")+'</div>';
+    }
+    html+='</div>';
+  });
+  document.getElementById("offCandidates").innerHTML=html;
+  document.querySelectorAll("#offCandidates .nchip").forEach(b=>{
+    b.onclick=()=>{ const n=b.dataset.n;
+      if(S.off.some(o=>o.name===n)) S.off=S.off.filter(o=>o.name!==n);
+      else { S.off.push({name:n,reason:"休み"}); S.sel=S.sel.filter(x=>x!==n);
+             if(n===S.foreman) S.foremanAuto=false; }
+      renderOffSheet(); renderAll(); };
+  });
+}
+
+/* ---- 時間 ---- */
+function renderTimes(){
+  document.getElementById("fAllRows").innerHTML=MAIN_KINDS.map(k=>
+    '<button class="row'+(S.all[k]?" on":"")+'" data-k="'+esc(k)+'"><span>'+esc(k)+'</span>'+
+    '<span class="v'+(S.all[k]?"":" z")+'">'+fmt(S.all[k])+'</span></button>').join("");
+  document.querySelectorAll("#fAllRows .row").forEach(b=>b.onclick=()=>openPad("all",b.dataset.k));
+  document.getElementById("fMoreBtn").textContent=S.more
+    ? "− その他の時間を閉じる" : "＋ その他の時間（休日・移動・早出・深夜・突発）";
+  document.getElementById("fMoreRows").innerHTML=S.more?MORE_KINDS.map(k=>
+    '<button class="row'+(S.all[k]?" on":"")+'" data-k="'+esc(k)+'"><span>'+esc(k)+'</span>'+
+    '<span class="v'+(S.all[k]?"":" z")+'">'+fmt(S.all[k])+'</span></button>').join(""):"";
+  document.querySelectorAll("#fMoreRows .row").forEach(b=>b.onclick=()=>openPad("all",b.dataset.k));
+}
+function toggleMore(){ S.more=!S.more; renderTimes(); }
+
+function renderPersons(){
+  document.getElementById("fIndN").textContent="（"+S.sel.length+"人）";
+  if(!S.sel.length){
+    document.getElementById("fPersonRows").innerHTML='<div class="note">メンバーを選ぶと、ここに出ます。</div>';
+    return;
+  }
+  document.getElementById("fPersonRows").innerHTML=S.sel.map(n=>{
+    const ed=hasOwn(n);
+    return '<button class="prow'+(ed?" ed":"")+'" data-n="'+esc(n)+'">'+
+      '<div class="t1"><span class="nm">'+esc(n)+(ed?'<em>個別</em>':'')+'</span>'+
+      '<span class="tt">'+f1(netFor(n))+'</span></div>'+
+      '<div class="brk">'+brkFor(n)+'</div>'+
+      '<div class="tap">タップして直す</div></button>';
+  }).join("");
+  document.querySelectorAll("#fPersonRows .prow").forEach(b=>{
+    b.onclick=()=>openPad(b.dataset.n, MAIN_KINDS.filter(k=>S.all[k])[0]||"平日現場");
+  });
+}
+
+function renderChecks(){
+  document.getElementById("fChecks").innerHTML=CHECKS.map(k=>
+    '<button class="row'+(S.checks[k]?" on":"")+'" data-k="'+esc(k)+'"><span>'+esc(k)+'</span>'+
+    '<span class="v'+(S.checks[k]?"":" z")+'">'+(S.checks[k]?"〇":"−")+'</span></button>').join("");
+  document.querySelectorAll("#fChecks .row").forEach(b=>{
+    b.onclick=()=>{ S.checks[b.dataset.k]=!S.checks[b.dataset.k]; renderAll(); };
+  });
+  const m=S.sel.filter(n=>minusFor(n)>0);
+  document.getElementById("fChecksNote").innerHTML=
+    "出張・夜勤は、この送信のメンバー全員に付きます。"+
+    "<br>遅刻・早退は上の「個別」から、その人だけに入れてください。"+
+    (m.length?"<br>今つけている人："+m.map(n=>esc(n)+" −"+f1(minusFor(n))).join("・"):"");
+}
+
+function renderStepBtns(){
+  document.getElementById("btnToTime").disabled=!canStep2();
+  const g=S.sel.reduce((a,n)=>a+totalOf(hoursFor(n)),0);
+  document.getElementById("fSum").textContent="合計 "+f1(g)+"時間・"+S.sel.length+"人";
+}
+function canStep2(){
+  return !!((S.job||S.jobFree) && (S.sel.length || (S.mode==="edit" && S.off.length)));
+}
+function canSend(){
+  if(S.mode==="edit")
+    return canStep2() && (!S.sel.length || S.sel.some(n=>totalOf(hoursFor(n))>0));
+  return canStep2() && totalOf(S.all)>0;
+}
+
+/* ---- テンキー ---- */
+function openPad(who,kind){
+  S.padTarget={who,kind};
+  const isPerson=(who!=="all"&&who!=="allow");
+  const isMinus=(kind==="遅刻"||kind==="早退");
+  let cur;
+  if(who==="allow") cur=allowNow();
+  else if(who==="all") cur=S.all[kind]||0;
+  else if(kind==="遅刻") cur=lateFor(who);
+  else if(kind==="早退") cur=earlyFor(who);
+  else cur=hoursFor(who)[kind]||0;
+  S.pad=cur?cur.toFixed(1):"0";
+  document.getElementById("padTitle").textContent=
+    who==="allow" ? "職長手当（工数）"
+    : (who==="all"?"全員分":who)+" ─ "+kind+(isMinus?"（引く時間）":"");
+  /* 個別は、その他の時間を開いていた種類なら最初から開いておく */
+  if(isPerson && MORE_KINDS.indexOf(kind)>=0) S.padMore=true;
+  renderPadKinds();
+  document.getElementById("padReset").style.display=(isPerson&&hasOwn(who))?"block":"none";
+  renderPad(); openSheet("pad");
+}
+/* テンキーの「時間の種類」ボタン。
+   個別は 全員分と同じ11種類＋遅刻・早退。よく使う4つを先に出して、
+   残りは「その他の時間」で開く。遅刻・早退は色を分けて、いつも見える位置に置く。 */
+function renderPadKinds(){
+  const t=S.padTarget; if(!t) return;
+  const who=t.who, kind=t.kind;
+  const box=document.getElementById("padKinds");
+  const moreBtn=document.getElementById("padMoreBtn");
+  const moreBox=document.getElementById("padMoreKinds");
+  moreBtn.style.display="none"; moreBox.style.display="none"; moreBox.innerHTML="";
+  if(who==="allow"){ box.style.display="none"; return; }
+  box.style.display="flex";
+  if(who==="all"){
+    /* 全員分は今までどおり。その他の時間は前の画面で開け閉めする */
+    padChips(box, MORE_KINDS.indexOf(kind)>=0?MORE_KINDS:MAIN_KINDS, who, kind);
+    return;
+  }
+  padChips(box, MAIN_KINDS.concat(MINUS_KINDS), who, kind);
+  const h=hoursFor(who), set=MORE_KINDS.filter(k=>h[k]);
+  moreBtn.style.display="block";
+  moreBtn.textContent = S.padMore ? "− その他の時間を閉じる"
+    : (set.length ? "＋ その他の時間（"+set.map(k=>k+" "+f1(h[k])).join("／")+"）"
+                  : "＋ その他の時間（休日・移動・早出・深夜・突発）");
+  if(S.padMore){ moreBox.style.display="flex"; padChips(moreBox, MORE_KINDS, who, kind); }
+}
+function padChips(box,kinds,who,kind){
+  box.innerHTML=kinds.map(k=>
+    '<button class="chip sm'+(k===kind?" on":"")+(MINUS_KINDS.indexOf(k)>=0?" mn":"")+
+    '" data-k="'+esc(k)+'">'+esc(k)+'</button>').join("");
+  box.querySelectorAll(".chip").forEach(b=>b.onclick=()=>openPad(who,b.dataset.k));
+}
+/* 入力中の数字は消さずに、その他の時間だけ開け閉めする */
+function togglePadMore(){ S.padMore=!S.padMore; renderPadKinds(); }
+function renderPad(){
+  document.getElementById("padVal").textContent=S.pad;
+  document.getElementById("padQuick").innerHTML=["0.5","1.0","1.5","2.0","8.0"].map(v=>
+    '<button class="chip sm'+(S.pad===v?" on":"")+'" data-v="'+v+'" style="flex:1;justify-content:center;text-align:center">'+v+'</button>').join("");
+  document.querySelectorAll("#padQuick .chip").forEach(b=>b.onclick=()=>{ S.pad=b.dataset.v; renderPad(); });
+  document.getElementById("padKeys").innerHTML=["1","2","3","4","5","6","7","8","9",".","0","←"].map(k=>
+    '<button class="'+(k==="←"?"bs":"")+'" data-k="'+k+'">'+k+'</button>').join("");
+  document.querySelectorAll("#padKeys button").forEach(b=>{
+    b.onclick=()=>{ const k=b.dataset.k;
+      S.pad=k==="←"?(S.pad.slice(0,-1)||"0"):(S.pad==="0"&&k!=="."?k:S.pad+k);
+      renderPad(); };
+  });
+}
+function applyPad(){
+  const t=S.padTarget; if(!t){ closeSheet(); return; }
+  if(t.who==="allow"){
+    S.allow=Math.max(0,Math.min(99,parseFloat(S.pad)||0));
+    S.allowE=true;
+    closeSheet(); renderAllow(); return;
+  }
+  const v=Math.max(0,Math.min(24,parseFloat(S.pad)||0));
+  if(t.who==="all") S.all[t.kind]=v;
+  else if(t.kind==="遅刻"){ if(v) S.late[t.who]=v; else delete S.late[t.who]; }
+  else if(t.kind==="早退"){ if(v) S.early[t.who]=v; else delete S.early[t.who]; }
+  else { const base=S.ovr[t.who]||Object.assign({},S.all); base[t.kind]=v; S.ovr[t.who]=base; }
+  closeSheet(); renderAll();
+}
+/* その人の個別（時間の上書き・遅刻・早退）をぜんぶ消して、全員分と同じにする */
+function resetPerson(){
+  const t=S.padTarget; if(!t) return;
+  delete S.ovr[t.who]; delete S.late[t.who]; delete S.early[t.who];
+  closeSheet(); renderAll();
+}
+
+/* ================== 確認 ================== */
+function goConfirm(){
+  if(!canSend()) return;
+  const jobName=S.job?(JOBS.find(j=>j.no===S.job)||{}).name:S.jobFree;
+  document.getElementById("cfmDate").textContent=dLabel(S.date);
+  const chk=CHECKS.filter(k=>S.checks[k]).join("・")||"なし";
+  const mn=S.sel.filter(n=>minusFor(n)>0);
+  document.getElementById("cfmBox").innerHTML=
+    "<dt>工事</dt><dd>"+(S.job?'<span class="no">'+esc(S.job)+'</span><br>':'')+esc(jobName)+"</dd>"+
+    "<dt>区分</dt><dd>"+esc(S.kubun)+"</dd>"+
+    "<dt>職長</dt><dd>"+esc(S.foreman||"なし（空欄）")+"</dd>"+
+    "<dt>休み</dt><dd>"+(S.off.length?esc(S.off.map(o=>o.name+"（"+o.reason+"）").join("・")):"なし")+"</dd>"+
+    "<dt>チェック</dt><dd>"+esc(chk)+"</dd>"+
+    "<dt>遅刻・早退</dt><dd>"+(mn.length
+      ? esc(mn.map(n=>n+"（"+[S.late[n]?"遅刻 −"+f1(S.late[n]):"",S.early[n]?"早退 −"+f1(S.early[n]):""]
+          .filter(Boolean).join("・")+"）").join("　"))
+      : "なし")+"</dd>";
+  const grand=S.sel.reduce((a,n)=>a+netFor(n),0);
+  document.getElementById("cfmPeople").textContent=S.sel.length+"人の時間";
+  document.getElementById("cfmTotal").textContent="合計 "+f1(grand);
+  document.getElementById("cfmRows").innerHTML=S.sel.map(n=>{
+    const ed=hasOwn(n);
+    return '<div class="srow"><div style="flex:1;min-width:0"><div class="n">'+esc(n)+(ed?'<em>個別</em>':'')+'</div>'+
+      '<div class="brk">'+brkFor(n)+'</div></div><div class="t">'+f1(netFor(n))+'</div></div>';
+  }).join("");
+  renderAllow();
+  const w=[];
+  S.sel.forEach(n=>{ if(totalOf(hoursFor(n))===0) w.push(n+"さんの時間が0です。"); });
+  document.getElementById("cfmWarn").innerHTML=w.length?'<div class="warnbox">'+w.map(esc).join("<br>")+'</div>':"";
+  /* 新規で送るときと、送った分を直すときで、言い方を変える */
+  const ed=S.mode==="edit";
+  document.getElementById("ttCfm").textContent=ed?"直した内容の確認":"送信前の確認";
+  document.getElementById("cfmLead").textContent=ed?"この内容に直します":"この内容で送ります";
+  document.getElementById("cfmNote").textContent=ed
+    ? "直すと事務所にもすぐ反映されます・直したことは修正履歴に残ります"
+    : "送信すると事務所に届きます・あとから直せます";
+  document.getElementById("btnSend").textContent=ed?"この内容で直す":"送信する";
+  document.getElementById("cfmWhy").style.display=ed?"block":"none";
+  if(!ed) document.getElementById("cfmWhyIn").value="";
+  showScreen("scConfirm");
+}
+
+/* ---- 職長手当 ---- */
+function renderAllow(){
+  const wrap=document.getElementById("cfmAllowWrap");
+  if(!S.foreman){ wrap.style.display="none"; return; }
+  wrap.style.display="block";
+  const auto=autoAllow(), v=allowNow();
+  document.getElementById("cfmAllowVal").textContent=allowTx(v);
+  document.getElementById("cfmAllowLbl").textContent=S.allowE?"手で直した数":"自動で計算した数";
+  document.getElementById("cfmAllowRow").classList.toggle("on",S.allowE);
+  document.getElementById("cfmAllowReset").style.display=S.allowE?"block":"none";
+  const yak=S.sel.filter(n=>YAKUIN.indexOf(n)>=0);
+  const zero=S.sel.filter(n=>YAKUIN.indexOf(n)<0&&workNetFor(n)<=0);
+  const half=S.sel.filter(n=>{ const w=workNetFor(n);
+    return YAKUIN.indexOf(n)<0 && w>0 && w<=ALLOW_BORDER; });
+  document.getElementById("cfmAllowNote").innerHTML=
+    "自動計算 "+allowTx(auto)+"（"+esc(S.foreman)+"さん本人を含めて数えています）"+
+    (yak.length?"<br>役員のため数えていない人："+yak.map(esc).join("・"):"")+
+    (zero.length?"<br>実働がないので数えていない人："+zero.map(esc).join("・")+
+      "（移動・残業だけの日。必要なら下の数字を手で足してください）":"")+
+    (half.length?"<br>実働4時間以下なので0.5で数えた人："+half.map(esc).join("・"):"")+
+    (S.off.length?"<br>休みの人は数えていません："+S.off.map(o=>esc(o.name)).join("・"):"")+
+    "<br>おかしいと思ったら、上をタップして直せます。";
+}
+function openAllowPad(){ openPad("allow","職長手当"); }
+function resetAllow(){ S.allowE=false; S.allow=0; renderAllow(); }
+
+/* ================== 送信 ================== */
+/* 今の入力から、保存する行を組み立てる（新規も、直したときも同じ形） */
+function buildRows(batch, stamp){
+  const jobName=S.job?(JOBS.find(j=>j.no===S.job)||{}).name:S.jobFree;
+  /* 職長手当（工数）。この送信の全行に同じ値を持たせて、あとから管理画面で直せるようにする */
+  const fa=S.foreman ? allowNow() : 0;
+  const faE=(S.foreman&&S.allowE) ? 1 : 0;
+  /* 誰が送ったか（by）。職長欄（f）とは別。送信履歴はこれで拾う。
+     直しているときは、最初に送った人をそのまま残す */
+  const by=(S.mode==="edit" ? (S.sentBy||"") : "") || ME || "";
+  const rows=[];
+  S.sel.forEach(n=>{
+    const w=WORKERS.find(x=>x.name===n);
+    rows.push({d:S.date,n:n,k:(w?w.kubun:""),shozoku:(w?w.shozoku:""),
+      no:S.job||"",j:jobName||"",kubun:S.kubun,f:S.foreman||"",by:by,
+      h:Object.assign({},hoursFor(n)),off:0,offReason:"",
+      s:S.checks["出張"]?1:0,y:S.checks["夜勤"]?1:0,
+      late:lateFor(n),early:earlyFor(n),
+      fa:fa,faE:faE,batch:batch,at:stamp});
+  });
+  S.off.forEach(o=>{
+    const w=WORKERS.find(x=>x.name===o.name);
+    rows.push({d:S.date,n:o.name,k:(w?w.kubun:""),shozoku:(w?w.shozoku:""),
+      no:S.job||"",j:jobName||"",kubun:S.kubun,f:S.foreman||"",by:by,
+      h:{},off:1,offReason:o.reason,s:0,y:0,late:0,early:0,
+      fa:fa,faE:faE,batch:batch,at:stamp});
+  });
+  return rows;
+}
+/* 確認画面のボタン。新規なら送信、直しているなら上書き。
+   その前に、平日の時間が1日 WEEKDAY_LIMIT を超える人がいないかを確かめる。
+   読めなかったときは止めずに送る（電波が悪くて送れなくなるほうが困るため） */
+function submitNippo(){
+  const btn=document.getElementById("btnSend");
+  if(btn.disabled) return;
+  const label=btn.textContent;
+  btn.disabled=true; btn.textContent="確認中...";
+  fetchDayRows(S.date).then(overWeekday).catch(()=>null).then(over=>{
+    btn.disabled=false; btn.textContent=label;
+    if(over && over.length){ showOver(over); return; }
+    if(!over) alert("確認できませんでした。送信します");
+    if(S.mode==="edit") doUpdate(); else doSend();
+  });
+}
+
+/* ---- 平日8時間超の確認 ---- */
+/* 「平日」とつく区分の合計。kanri.html の weekdayOf と同じ式（遅刻・早退は引かない） */
+function weekdayOf(r){
+  const h = r.h || {};
+  let a = 0;
+  Object.keys(h).forEach(k=>{ if(k.indexOf("平日")>=0) a += (h[k]||0); });
+  return a;
+}
+/* その日の日報だけを読む。待ちきれなければ失敗にする */
+function fetchDayRows(ds){
+  const q=db.ref("nippo/"+ds.slice(0,7)+"/rows").orderByChild("d").equalTo(ds).once("value")
+    .then(snap=>{ const v=snap.val()||{}; return Object.keys(v).map(k=>v[k]).filter(Boolean); });
+  const t=new Promise((_,ng)=>setTimeout(()=>ng(new Error("timeout")),DAY_CHECK_WAIT));
+  return Promise.race([q,t]);
+}
+/* 超える人の一覧。送信者も注番も問わず、その日に届いている分を全部数える。
+   直しているときは、直そうとしている元の送信の分は数えない（入れ替わるので）。
+   今回の平日が0の人（残業だけ・休日だけ）は、今回の送信で増えないので止めない */
+function overWeekday(dayRows){
+  const mine=(S.mode==="edit"&&S.editB) ? (r=>inBatch(r,S.editB)) : (()=>false);
+  const had={};
+  dayRows.forEach(r=>{
+    if(!r.n || r.off || r.d!==S.date || mine(r)) return;
+    had[r.n]=(had[r.n]||0)+weekdayOf(r);
+  });
+  return S.sel.map(n=>({n:n, had:had[n]||0, add:weekdayOf({h:hoursFor(n)})}))
+    .filter(x=>x.add>0 && r1(x.had+x.add)>WEEKDAY_LIMIT);
+}
+function showOver(list){
+  document.getElementById("ovList").innerHTML=list.map(x=>
+    '<p><b>'+esc(x.n)+'さん</b> は '+esc(dShort(S.date))+'の平日の時間が<br>'+
+    (r1(x.had)>0
+      ? 'すでに <b>'+f1(x.had)+'</b> 届いています。<br>'+
+        '今回の <b>'+f1(x.add)+'</b> を足すと <b>'+f1(x.had+x.add)+'</b> になります。'
+      /* まだ届いていない人は、今回の分だけで超えている */
+      : '今回の <b>'+f1(x.add)+'</b> だけで '+f1(WEEKDAY_LIMIT)+' を超えています。')+'</p>').join("");
+  openSheet("over");
+}
+
+function doSend(){
+  const btn=document.getElementById("btnSend");
+  btn.disabled=true; btn.textContent="送信中...";
+  const jobName=S.job?(JOBS.find(j=>j.no===S.job)||{}).name:S.jobFree;
+  const ym=S.date.slice(0,7);
+  const now=new Date();
+  const hm=String(now.getHours()).padStart(2,"0")+":"+String(now.getMinutes()).padStart(2,"0");
+  const stamp=now.getFullYear()+"/"+(now.getMonth()+1)+"/"+now.getDate()+" "+hm;
+  const batch="b"+now.getTime();
+  const fa=S.foreman ? allowNow() : 0;
+  const rows=buildRows(batch, stamp);
+  db.ref("nippo/"+ym+"/rows").once("value").then(snap=>{
+    const cur=snap.val()||[];
+    return db.ref("nippo/"+ym).update({rows:cur.concat(rows),updatedAt:stamp});
+  }).then(()=>{
+    document.getElementById("doneAt").textContent="RECEIVED "+hm;
+    document.getElementById("doneSub").textContent=dShort(S.date)+"・"+S.kubun;
+    document.getElementById("doneJob").innerHTML=
+      (S.job?'<span style="font-family:ui-monospace,monospace;font-weight:600;color:var(--green)">'+esc(S.job)+'</span> ':'')+esc(jobName||"");
+    const g=S.sel.reduce((a,n)=>a+netFor(n),0);
+    document.getElementById("doneCnt").textContent=
+      S.sel.length+"人 ／ 合計 "+f1(g)+"時間"+(S.off.length?" ／ 休み "+S.off.length+"人":"")+
+      (S.foreman?" ／ 職長手当 "+allowTx(fa):"");
+    btn.disabled=false; btn.textContent="送信する";
+    showScreen("scDone");
+  }).catch(e=>{
+    alert("送信に失敗しました: "+e.message);
+    btn.disabled=false; btn.textContent="送信する";
+  });
+}
+function continueNext(){
+  S.job=null; S.jobFree=null; S.all={}; S.ovr={}; S.more=false;
+  S.checks={出張:false,夜勤:false}; S.late={}; S.early={};
+  S.allow=0; S.allowE=false;
+  showScreen("scStep1"); renderAll();
+}
+/* 入力をまっさらに戻す（直している最中のしるしも消す） */
+function resetInput(){
+  S.mode="new"; S.editBatch=null; S.editYm=null; S.editAt=""; S.editB=null; S.orig=null;
+  S.sentBy="";
+  S.date=todayStr();
+  S.job=null; S.jobFree=null; S.all={}; S.ovr={}; S.sel=[]; S.off=[]; S.guests=[]; S.more=false;
+  S.checks={出張:false,夜勤:false}; S.late={}; S.early={};
+  S.allow=0; S.allowE=false;
+  applyTeam();
+}
+function finishSend(){ resetInput(); goTop(); }
+
+/* ================== 送信履歴（今月・自分が送った分） ================== */
+/* 拾うのは「誰が送ったか（by）」。職長欄（f）では拾わない。
+   自分がメンバーに入っていなくても、職長欄を空にして送っていても出る。
+   by が入っていない古い日報だけ、今までどおり職長欄で拾う */
+function sentByMe(r){ return r.by ? r.by===ME : (r.f||"")===ME; }
+function myBatches(){
+  if(!ME) return [];
+  const bt={};
+  monthRows(curYm()).filter(sentByMe).forEach(r=>{
+    const k=rowBatchKey(r); (bt[k]=bt[k]||[]).push(r);
+  });
+  return Object.keys(bt).map(k=>({key:k, batch:bt[k][0].batch||"", rows:bt[k]}))
+    .sort((a,b)=>String(b.rows[0].d).localeCompare(String(a.rows[0].d))
+              || String(b.rows[0].at||"").localeCompare(String(a.rows[0].at||"")));
+}
+function goHist(){
+  if(!ME){ openMe(false); return; }
+  showScreen("scHist"); renderHist();
+}
+function renderHist(){
+  document.getElementById("histMonth").textContent=curYm().replace("-","年")+"月";
+  document.getElementById("histFlash").innerHTML=
+    S.flash?'<div class="flash">'+esc(S.flash)+'</div>':"";
+  HIST=myBatches();
+  document.getElementById("histNote").textContent=
+    ME+"さんがこの端末から送った、今月の日報です。（"+HIST.length+"件・新しい順）"+
+    "　職長かどうかは関係ありません。";
+  document.getElementById("histList").innerHTML=HIST.length?HIST.map((b,i)=>{
+    const r=b.rows[0];
+    const work=b.rows.filter(x=>!x.off), offs=b.rows.filter(x=>x.off);
+    const t=work.reduce((a,x)=>a+netOf(x),0);
+    return '<div class="hcard">'+
+      '<div class="hd"><span class="dt">'+dShort(r.d)+
+        (r.at?'　'+esc(String(r.at).split(" ")[1]||"")+' 送信':'')+
+        (b.rows.some(x=>x.editAt)?'　（直した分）':'')+'</span>'+
+        '<span class="tt">'+f1(t)+'</span></div>'+
+      '<div class="nm">'+(r.no?'<span class="no">'+esc(r.no)+'</span> ':'')+esc(r.j||"")+'</div>'+
+      '<div class="mt">'+esc(r.kubun||"")+' ／ '+work.length+'人'+
+        (offs.length?' ／ 休み '+offs.length+'人':'')+
+        (work.length?'<br>'+esc(work.map(x=>x.n).join("・")):'')+
+        (offs.length?'<br>休み：'+esc(offs.map(x=>x.n).join("・")):'')+'</div>'+
+      '<div class="acts">'+
+        '<button data-ed="'+i+'">直す</button>'+
+        '<button class="del" data-dl="'+i+'">消す</button>'+
+        '<button class="rep" data-cp="'+i+'">同じ内容で送る</button>'+
+      '</div></div>';
+  }).join(""):'<div class="empty">今月はまだ送っていません。</div>';
+  document.querySelectorAll("#histList [data-ed]").forEach(b=>{
+    b.onclick=()=>startEdit(Number(b.dataset.ed)); });
+  document.querySelectorAll("#histList [data-dl]").forEach(b=>{
+    b.onclick=()=>askDelete(Number(b.dataset.dl)); });
+  document.querySelectorAll("#histList [data-cp]").forEach(b=>{
+    b.onclick=()=>startCopy(Number(b.dataset.cp)); });
+}
+
+/* ---- 送信済みの1件を入力画面に読み込む ---- */
+function loadBatch(b){
+  const rows=b.rows;
+  const work=rows.filter(r=>!r.off), offs=rows.filter(r=>r.off);
+  const r0=rows[0], rc=work[0]||r0;
+  S.date=r0.d;
+  S.foreman=r0.f||null; S.foremanAuto=false;
+  /* 送った人はそのまま残す（直しても、送った人は変わらない） */
+  S.sentBy=r0.by||"";
+  S.job=r0.no||null; S.jobFree=r0.no?null:(r0.j||null);
+  S.kubun=r0.kubun||KUBUN[0]||"現場";
+  S.sel=work.map(r=>r.n);
+  S.off=offs.map(r=>({name:r.n,reason:r.offReason||"休み"}));
+  S.guests=rows.map(r=>r.n).filter(n=>!WORKERS.some(w=>w.name===n));
+  /* いちばん時間の多い人の内訳を「全員分」にして、違う人だけ個別にする */
+  let base={}, best=-1;
+  work.forEach(r=>{ const t=totalOf(r.h); if(t>best){ best=t; base=Object.assign({},r.h||{}); } });
+  S.all=base; S.ovr={}; S.late={}; S.early={};
+  work.forEach(r=>{
+    const h=Object.assign({},r.h||{});
+    if(hKey(h)!==hKey(base)) S.ovr[r.n]=h;
+    if(r.late)  S.late[r.n]=r.late;
+    if(r.early) S.early[r.n]=r.early;
+  });
+  S.checks={出張:!!rc.s,夜勤:!!rc.y};
+  S.more=work.some(r=>MORE_KINDS.some(k=>(r.h||{})[k]));
+  const fa=rows.map(r=>r.fa).find(v=>v!==undefined&&v!==null&&v!=="");
+  S.allowE=rows.some(r=>r.faE);
+  S.allow=S.allowE?(Number(fa)||0):0;
+}
+function startEdit(i){
+  const b=HIST[i]; if(!b) return;
+  S.flash="";
+  loadBatch(b);
+  S.mode="edit"; S.editB=b; S.editBatch=b.batch;
+  S.editYm=String(b.rows[0].d).slice(0,7);
+  S.editAt=b.rows[0].at||"";
+  S.orig=rowsSnap(b.rows);
+  showScreen("scStep1"); renderAll();
+}
+function startCopy(i){
+  const b=HIST[i]; if(!b) return;
+  S.flash="";
+  loadBatch(b);
+  S.mode="new"; S.editB=null; S.editBatch=null; S.editYm=null; S.editAt=""; S.orig=null;
+  S.sentBy="";   /* 新しい送信なので、送った人は今この端末を使っている人になる */
+  /* 日付は翌日。先の日付は送れないので今日までにする */
+  const d=new Date(b.rows[0].d+"T00:00:00"); d.setDate(d.getDate()+1);
+  let ds=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+  if(ds>todayStr()) ds=todayStr();
+  S.date=ds;
+  showScreen("scStep1"); renderAll();
+}
+
+/* ---- 直した中身を見比べて、修正履歴に書く文にする ---- */
+function stateSnap(){
+  const jobName=S.job?(JOBS.find(j=>j.no===S.job)||{}).name:S.jobFree;
+  const per={};
+  S.sel.forEach(n=>{ per[n]=hKey(hoursFor(n))+"|遅"+r1(lateFor(n))+"|早"+r1(earlyFor(n)); });
+  return { d:S.date, no:S.job||"", j:jobName||"", kubun:S.kubun, f:S.foreman||"",
+    sel:S.sel.slice().sort(), off:S.off.map(o=>o.name+"（"+o.reason+"）").sort(),
+    s:!!S.checks["出張"], y:!!S.checks["夜勤"], per:per,
+    fa:r1(S.foreman?allowNow():0) };
+}
+function rowsSnap(rows){
+  const work=rows.filter(r=>!r.off), offs=rows.filter(r=>r.off);
+  const r0=rows[0], rc=work[0]||r0, per={};
+  work.forEach(r=>{ per[r.n]=hKey(r.h)+"|遅"+r1(r.late||0)+"|早"+r1(r.early||0); });
+  const fa=rows.map(r=>r.fa).find(v=>v!==undefined&&v!==null&&v!=="");
+  return { d:r0.d, no:r0.no||"", j:r0.j||"", kubun:r0.kubun||"", f:r0.f||"",
+    sel:work.map(r=>r.n).sort(), off:offs.map(r=>r.n+"（"+(r.offReason||"休み")+"）").sort(),
+    s:!!rc.s, y:!!rc.y, per:per, fa:r1(Number(fa)||0) };
+}
+function diffText(){
+  const a=S.orig, b=stateSnap();
+  const head=dShort(a?a.d:b.d)+"　"+((a?a.no:b.no)?(a?a.no:b.no)+" ":"")+((a?a.j:b.j)||"");
+  if(!a) return head;
+  const c=[];
+  if(a.d!==b.d)         c.push("日付 "+dShort(a.d)+" → "+dShort(b.d));
+  if(a.no!==b.no)       c.push("注番 "+(a.no||"―")+" → "+(b.no||"―"));
+  if(a.j!==b.j)         c.push("件名 "+(a.j||"―")+" → "+(b.j||"―"));
+  if(a.kubun!==b.kubun) c.push("区分 "+(a.kubun||"―")+" → "+(b.kubun||"―"));
+  if(a.f!==b.f)         c.push("職長 "+(a.f||"―")+" → "+(b.f||"―"));
+  const add=b.sel.filter(n=>a.sel.indexOf(n)<0), rm=a.sel.filter(n=>b.sel.indexOf(n)<0);
+  if(add.length) c.push("メンバー追加 "+add.join("・"));
+  if(rm.length)  c.push("メンバー削除 "+rm.join("・"));
+  if(a.off.join("・")!==b.off.join("・"))
+    c.push("休み "+(a.off.join("・")||"なし")+" → "+(b.off.join("・")||"なし"));
+  if(a.s!==b.s) c.push("出張 "+(a.s?"あり":"なし")+" → "+(b.s?"あり":"なし"));
+  if(a.y!==b.y) c.push("夜勤 "+(a.y?"あり":"なし")+" → "+(b.y?"あり":"なし"));
+  const tch=b.sel.filter(n=>a.per[n]!==undefined && a.per[n]!==b.per[n]);
+  if(tch.length) c.push("時間を直した人 "+tch.join("・"));
+  if(Math.abs(a.fa-b.fa)>0.001) c.push("職長手当 "+allowTx(a.fa)+" → "+allowTx(b.fa));
+  return head+"　"+(c.length?c.join("／"):"変更なし");
+}
+
+/* ---- 直した内容を保存する ---- */
+function doUpdate(){
+  const b=S.editB;
+  if(!b){ alert("元の日報が見つかりませんでした"); return; }
+  const btn=document.getElementById("btnSend");
+  btn.disabled=true; btn.textContent="保存中...";
+  const back=()=>{ btn.disabled=false; btn.textContent="この内容で直す"; };
+  const oldYm=S.editYm, newYm=S.date.slice(0,7), now=stampNow();
+  const rows=buildRows(S.editBatch||("b"+Date.now()), S.editAt||now)
+    .map(r=>Object.assign(r,{editAt:now,editBy:ME||""}));
+  const what="送信アプリから修正　"+diffText();
+  const why=(document.getElementById("cfmWhyIn").value||"").trim();
+  const strip=arr=>arr.filter(x=>!inBatch(x,b));
+  let p;
+  if(oldYm===newYm){
+    p=db.ref("nippo/"+oldYm+"/rows").once("value").then(snap=>{
+      const cur=(snap.val()||[]).filter(Boolean);
+      return db.ref("nippo/"+oldYm).update({rows:strip(cur).concat(rows),updatedAt:now});
+    });
+  } else {
+    p=db.ref("nippo/"+oldYm+"/rows").once("value").then(snap=>{
+      const cur=(snap.val()||[]).filter(Boolean);
+      return db.ref("nippo/"+oldYm).update({rows:strip(cur),updatedAt:now});
+    }).then(()=>db.ref("nippo/"+newYm+"/rows").once("value")).then(snap=>{
+      const cur=(snap.val()||[]).filter(Boolean);
+      return db.ref("nippo/"+newYm).update({rows:cur.concat(rows),updatedAt:now});
+    });
+  }
+  p.then(()=>pushLog(what, why, oldYm))
+   .then(()=>{
+     btn.disabled=false;
+     resetInput();
+     S.flash="日報を1件直しました。事務所の修正履歴に残ります。"+
+       (oldYm!==newYm?"（別の月へ動かしたので、この一覧からは消えます）":"");
+     showScreen("scHist"); renderHist();
+   })
+   .catch(e=>{ alert("保存に失敗しました: "+e.message); back(); });
+}
+
+/* ---- 消す ---- */
+function askDelete(i){
+  const b=HIST[i]; if(!b) return;
+  S.delB=b;
+  const r=b.rows[0], work=b.rows.filter(x=>!x.off);
+  document.getElementById("dlDate").textContent=dLabel(r.d);
+  document.getElementById("dlJob").textContent=(r.no?r.no+"　":"")+(r.j||"");
+  document.getElementById("dlSum").textContent=(r.kubun||"")+" ／ "+work.length+"人 ／ 合計 "+
+    f1(work.reduce((a,x)=>a+netOf(x),0))+"時間"+
+    (b.rows.length>work.length?" ／ 休み "+(b.rows.length-work.length)+"人":"");
+  document.getElementById("dlWhy").value="";
+  openSheet("del");
+}
+function doDelete(){
+  const b=S.delB;
+  if(!b){ closeSheet(); return; }
+  const r=b.rows[0], work=b.rows.filter(x=>!x.off);
+  const ym=String(r.d).slice(0,7), now=stampNow();
+  const why=(document.getElementById("dlWhy").value||"").trim();
+  const what="送信アプリから削除　"+dShort(r.d)+"　"+(r.no?r.no+" ":"")+(r.j||"")+
+    "　／　"+(r.kubun||"")+"　職長 "+(r.f||"―")+"　／　"+work.length+"人・合計 "+
+    f1(work.reduce((a,x)=>a+netOf(x),0))+"時間"+
+    (b.rows.length>work.length?"／休み "+(b.rows.length-work.length)+"人":"");
+  db.ref("nippo/"+ym+"/rows").once("value").then(snap=>{
+    const cur=(snap.val()||[]).filter(Boolean);
+    return db.ref("nippo/"+ym).update({rows:cur.filter(x=>!inBatch(x,b)),updatedAt:now});
+  }).then(()=>pushLog(what, why, ym))
+   .then(()=>{
+     S.delB=null;
+     S.flash="日報を1件消しました。事務所の修正履歴に残ります。";
+     closeSheet(); renderHist();
+   })
+   .catch(e=>alert("削除に失敗しました: "+e.message));
+}
+
+/* ================== 工事一覧 ================== */
+let jFilter="all";
+function renderJobsPage(){
+  const q=(document.getElementById("jSearch").value||"").trim();
+  const live=JOBS.filter(j=>CLOSED.indexOf(j.no)<0);
+  const redN=live.filter(j=>jobAlert(j)==="red").length;
+  const amberN=live.filter(j=>jobAlert(j)==="amber").length;
+  const staleN=redN+amberN;
+  const fixedN=live.filter(j=>j.fixed).length;
+  /* タブは管理画面（PC版）とそろえる */
+  const defs=[{k:"all",l:"すべて（"+live.length+"）"},{k:"fixed",l:"常設（"+fixedN+"）"},
+    {k:"normal",l:"通常（"+(live.length-fixedN)+"）"},
+    {k:"stale",l:"要確認（"+staleN+"）"},{k:"closed",l:"閉じた（"+CLOSED.length+"）"}];
+  document.getElementById("jFilters").innerHTML=defs.map(f=>
+    '<button class="chip sm'+(jFilter===f.k?" on":"")+'" data-k="'+esc(f.k)+'">'+esc(f.l)+'</button>').join("");
+  /* 担当は別の行に分ける。件数の多い順 */
+  const oc={};
+  live.forEach(j=>{ if(j.owner) oc[j.owner]=(oc[j.owner]||0)+1; });
+  const owners=Object.keys(oc).sort((a,b)=>(oc[b]-oc[a])||a.localeCompare(b,"ja"));
+  document.getElementById("jOwners").innerHTML=owners.length?owners.map(o=>
+    '<button class="chip sm'+(jFilter===o?" on":"")+'" data-k="'+esc(o)+'">'+esc(o)+
+    '<span class="n">'+oc[o]+'</span></button>').join("")
+    :'<div class="note" style="margin-top:0">担当者の登録がありません</div>';
+  document.querySelectorAll("#jFilters .chip,#jOwners .chip").forEach(b=>{
+    b.onclick=()=>{ jFilter=b.dataset.k; renderJobsPage(); };
+  });
+  const wtx=[];
+  if(redN) wtx.push('<div class="warnbox">'+redN+'件が<b>要確認</b>です（工期の終了日を過ぎた／1か月以上使われていない）。担当者が確認して閉じてください。</div>');
+  if(amberN) wtx.push('<div class="warnbox" style="background:var(--amber-bg);border-left-color:var(--amber);color:var(--amber)">'+amberN+'件が<b>まもなく工期の終了日</b>です（あと7日以内）。</div>');
+  document.getElementById("jWarn").innerHTML=wtx.join("");
+
+  const list=JOBS.filter(j=>{
+    const cl=CLOSED.indexOf(j.no)>=0;
+    if(jFilter==="closed") return cl;
+    if(cl) return false;
+    if(!q||( (j.no+" "+j.name).indexOf(q)>=0 )){} else return false;
+    if(jFilter==="all") return true;
+    if(jFilter==="fixed") return !!j.fixed;
+    if(jFilter==="normal") return !j.fixed;
+    if(jFilter==="stale") return isStale(j);
+    return (j.owner||"")===jFilter;
+  }).sort((a,b)=>(b.fixed?1:0)-(a.fixed?1:0)||String(a.no).localeCompare(String(b.no)));
+
+  document.getElementById("jCount").textContent=list.length+"件 ／ 注番の頭2文字で並んでいます";
+  document.getElementById("jList").innerHTML=list.length?list.map(j=>{
+    const al=jobAlert(j), cl=CLOSED.indexOf(j.no)>=0;
+    const tm=termTx(j);
+    return '<div class="jrow'+(al==="red"?" stale":al==="amber"?" soon":"")+'"><div class="bd2">'+
+      '<div class="no">'+esc(j.no)+'</div>'+
+      '<div class="nm">'+esc(j.name)+'</div>'+
+      '<div class="mt">担当 '+esc(j.owner||"―")+' ／ '+agoLabel(daysAgo(LASTUSED[j.no]))+
+        (tm?" ／ "+esc(tm):"")+(j.fixed?" ／ 年間を通して使う注番":"")+'</div>'+
+      (j.fixed?'<div class="badge" style="display:inline-block;margin-top:8px;padding:4px 9px;background:var(--tint);color:var(--green);border-radius:2px;font-size:13px;font-weight:600">常設</div>':'')+
+      (al==="red"?'<div class="warn">'+esc(alertTx(j))+' ─ 担当の'+esc(j.owner||"")+'さん、終わっていませんか？</div>':'')+
+      (al==="amber"?'<div class="warn" style="color:var(--amber)">'+esc(alertTx(j))+' ─ 工期の終了日が近づいています。</div>':'')+
+      '</div>'+
+      (cl?'<button class="restore" data-rs="'+esc(j.no)+'">戻す</button>'
+         :'<button class="trash" data-tr="'+esc(j.no)+'">🗑</button>')+
+      '</div>';
+  }).join(""):'<div class="empty">該当する工事がありません</div>';
+  document.querySelectorAll("#jList [data-tr]").forEach(b=>{
+    b.onclick=()=>{ S.closeTarget=b.dataset.tr; showCloseSheet(); };
+  });
+  document.querySelectorAll("#jList [data-rs]").forEach(b=>{
+    b.onclick=()=>{
+      const next=CLOSED.filter(n=>n!==b.dataset.rs);
+      db.ref("master/closed").set(next);
+    };
+  });
+}
+document.getElementById("jSearch").addEventListener("input", renderJobsPage);
+function showCloseSheet(){
+  const j=JOBS.find(x=>x.no===S.closeTarget)||{};
+  document.getElementById("clNo").textContent=j.no||"";
+  document.getElementById("clName").textContent=j.name||"";
+  document.getElementById("clOwner").textContent="担当 "+(j.owner||"―");
+  document.getElementById("clFixed").innerHTML=j.fixed?
+    '<div style="margin-top:12px;padding:10px 12px;background:var(--tint);border-left:3px solid var(--green);border-radius:2px;font-size:14.5px;font-weight:600;color:var(--green-d)">常設の注番です。削除すると今後の日報で選べなくなります。</div>':"";
+  openSheet("close");
+}
+function doClose(){
+  const no=S.closeTarget; if(!no){ closeSheet(); return; }
+  db.ref("master/closed").set(CLOSED.concat([no])).then(closeSheet);
+}
+
+/* ================== 起動 ================== */
+if(ME) renderTop(); else openMe(false);
+</script>
+</body>
+</html>
